@@ -9,6 +9,7 @@ Positions after EOS are filled with PAD_ID (1025), also never masked,
 and excluded from loss via content_mask.
 """
 import os, math, time, json
+import sentencepiece as spm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -35,6 +36,7 @@ VAR_EVAL_STEPS = 128  # higher = tighter bound
 
 DATA_DIR         = "data/datasets/fineweb10B_sp1024"
 MAX_TRAIN_SHARDS = 1  # set 0 to load all shards (80 = ~16 GB)
+TOKENIZER_PATH   = "data/tokenizers/fineweb_1024_bpe.model"
 
 torch.manual_seed(SEED); np.random.seed(SEED)
 NEG_INF = -1e6
@@ -307,6 +309,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9,0.95), weight_decay=0.1, fused=True)
     val_chunks = build_chunk_index(val_np, SEQ_LEN)
     t0 = time.time(); losses = []
+    loss_log = {"train_steps": [], "train_losses": [], "val_steps": [], "val_losses": []}
     model.train()
 
     for step in range(TRAIN_STEPS):
@@ -320,6 +323,8 @@ def main():
             loss.backward(); accum_loss += loss.item()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step(); losses.append(accum_loss)
+        loss_log["train_steps"].append(step)
+        loss_log["train_losses"].append(float(accum_loss))
         if step % 100 == 0:
             model.eval()
             with torch.no_grad():
@@ -327,6 +332,8 @@ def main():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     val_loss = mdlm_loss(model, val_batch).item()
             model.train()
+            loss_log["val_steps"].append(step)
+            loss_log["val_losses"].append(float(val_loss))
             avg     = np.mean(losses[-100:])
             elapsed = time.time() - t0
             tok_s   = (step+1)*BATCH_SIZE*GRAD_ACCUM*SEQ_LEN/elapsed
@@ -356,12 +363,16 @@ def main():
     print(f"  VARIATIONAL BPB: {bpb:.4f}")
     print(f"  PR #820 MDLM:    1.625")
     print(f"  PR #888 MDLM:    1.1465")
-    print(f"  Our v4 MDLM:     (see v4_results.json)")
     print(f"  AR baseline:     1.22")
     print(f"{'='*60}", flush=True)
 
-    json.dump({"var_bpb": bpb, "params": n_params, "train_min": train_time/60,
-               "var_eval_steps": VAR_EVAL_STEPS, "train_loss": float(np.mean(losses[-100:]))},
-              open(os.path.expanduser("~/v5_results.json"), "w"), indent=2)
+    results = {"var_bpb": bpb, "params": n_params, "train_min": train_time/60,
+               "var_eval_steps": VAR_EVAL_STEPS, "train_loss": float(np.mean(losses[-100:]))}
+    json.dump(results, open("./v5_results.json", "w"), indent=2)
+
+    # ── post-training visualizations ──
+    from visualize_training import post_training_visualizer
+    tokenizer = spm.SentencePieceProcessor(model_file=TOKENIZER_PATH)
+    post_training_visualizer(loss_log, results, model, val_np, tokenizer, device=DEVICE)
 
 if __name__ == "__main__": main()
