@@ -27,7 +27,7 @@ SEQ_LEN = 2048; BATCH_SIZE = 8; GRAD_ACCUM = 4
 
 TRAIN_STEPS = 6000
 LR = 6e-4
-WARMUP_STEPS = 300
+WARMUP_STEPS = 300 # Note: this is part of training steps
 WARMDOWN_STEPS = 1500
 
 NOISE_EPS = 1e-3
