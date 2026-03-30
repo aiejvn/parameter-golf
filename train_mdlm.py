@@ -8,7 +8,7 @@ EOS positions are never masked — they serve as visible anchors.
 Positions after EOS are filled with PAD_ID (1025), also never masked,
 and excluded from loss via content_mask.
 """
-import os, math, time, json
+import glob, os, math, time, json
 import sentencepiece as spm
 import numpy as np
 import torch
@@ -26,7 +26,7 @@ DEVICE = "cuda"; SEED = 42
 NUM_LAYERS = 11; MODEL_DIM = 512; NUM_HEADS = 8; MLP_MULT = 3.0
 SEQ_LEN = 2048; BATCH_SIZE = 8; GRAD_ACCUM = 4
 
-TRAIN_STEPS = 6000
+TRAIN_STEPS = 5
 LR = 6e-4
 WARMUP_STEPS = 300 # Note: this is part of training steps
 WARMDOWN_STEPS = 1500
@@ -35,8 +35,11 @@ NOISE_EPS = 1e-3
 VAR_EVAL_STEPS = 128  # higher = tighter bound
 
 DATA_DIR         = "data/datasets/fineweb10B_sp1024"
-MAX_TRAIN_SHARDS = 1  # set 0 to load all shards (80 = ~16 GB)
+MAX_TRAIN_SHARDS = 0   # 0 = all available shards
+SHARDS_IN_MEMORY = 1   # how many train shards to hold in RAM at once
+ROTATE_SHARDS    = True  # False = load all MAX_TRAIN_SHARDS at once (original behaviour)
 TOKENIZER_PATH   = "data/tokenizers/fineweb_1024_bpe.model"
+NUM_SHARDS_DOWNLOADED = 3
 
 torch.manual_seed(SEED); np.random.seed(SEED)
 NEG_INF = -1e6
@@ -226,16 +229,51 @@ def _load_shard(path):
         return np.frombuffer(f.read(), dtype=np.uint16).astype(np.int64)
 
 
-def load_tokens(split):
-    import glob
+def find_shards(split):
     pattern = os.path.join(DATA_DIR, f"fineweb_{split}_*.bin")
     paths = sorted(glob.glob(pattern))
     if not paths:
         raise FileNotFoundError(f"No shards found: {pattern}")
     if split == "train" and MAX_TRAIN_SHARDS > 0:
         paths = paths[:MAX_TRAIN_SHARDS]
+    return paths
+
+
+def load_tokens(split):
+    """Load all shards for split at once (used for val and legacy)."""
+    paths = find_shards(split)
     print(f"  Loading {len(paths)} {split} shard(s)...", flush=True)
     return np.concatenate([_load_shard(p) for p in paths])
+
+
+class ShardedDataLoader:
+    """
+    Splits train shards into groups of SHARDS_IN_MEMORY.
+    Call load_group(i) to load group i explicitly.
+    Total training steps = TRAIN_STEPS * n_groups (one full pass per group).
+    """
+    def __init__(self):
+        self.paths     = find_shards("train")
+        self.n_shards  = len(self.paths)
+        self.window    = min(SHARDS_IN_MEMORY, self.n_shards)
+        self.n_groups  = math.ceil(self.n_shards / self.window)
+        self.tokens_np = None
+        self.chunks    = None
+        print(f"  ShardedDataLoader: {self.n_shards} shards, "
+              f"{self.window} per group, {self.n_groups} groups, "
+              f"{TRAIN_STEPS} steps/group → {TRAIN_STEPS * self.n_groups} total steps", flush=True)
+
+    def load_group(self, group_idx):
+        start       = group_idx * self.window
+        batch_paths = self.paths[start:start + self.window]
+        print(f"\n  [group {group_idx}/{self.n_groups}] Loading: "
+              f"{[os.path.basename(p) for p in batch_paths]}", flush=True)
+        self.tokens_np = np.concatenate([_load_shard(p) for p in batch_paths])
+        self.chunks    = build_chunk_index(self.tokens_np, SEQ_LEN)
+        print(f"  {len(self.tokens_np):,} tokens, {len(self.chunks):,} chunks", flush=True)
+
+    def sample_batch(self, batch_size, device):
+        return sample_doc_batch(self.tokens_np, self.chunks, batch_size, SEQ_LEN, device)
 
 
 def build_chunk_index(tokens_np, seq_len):
@@ -293,11 +331,16 @@ def main():
     print("="*60, flush=True)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    train_np     = load_tokens("train")
-    val_np       = load_tokens("val")
-    train_chunks = build_chunk_index(train_np, SEQ_LEN)
-    n_docs = len(np.where(train_np == EOS_ID)[0])
-    print(f"Train: {len(train_np):,} tokens, {n_docs:,} documents, {len(train_chunks):,} chunks")
+    val_np = load_tokens("val")
+    if ROTATE_SHARDS:
+        train_loader = ShardedDataLoader()
+        n_groups     = train_loader.n_groups
+    else:
+        train_np     = load_tokens("train")
+        train_chunks = build_chunk_index(train_np, SEQ_LEN)
+        n_docs = len(np.where(train_np == EOS_ID)[0])
+        print(f"Train: {len(train_np):,} tokens, {n_docs:,} docs, {len(train_chunks):,} chunks")
+        n_groups = 1
     print(f"Val:   {len(val_np):,} tokens")
 
     model = DiffusionLM().to(DEVICE).to(torch.bfloat16)
@@ -306,38 +349,46 @@ def main():
     print(f"EOS_ID={EOS_ID} never masked; PAD_ID={PAD_ID} always visible, excluded from loss")
     print(f"Eval: discrete ELBO ({VAR_EVAL_STEPS} steps)\n", flush=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9,0.95), weight_decay=0.1, fused=True)
+    optimizer  = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9,0.95), weight_decay=0.1, fused=True)
     val_chunks = build_chunk_index(val_np, SEQ_LEN)
     t0 = time.time(); losses = []
-    loss_log = {"train_steps": [], "train_losses": [], "val_steps": [], "val_losses": []}
+    loss_log   = {"train_steps": [], "train_losses": [], "val_steps": [], "val_losses": []}
+    global_step = 0
     model.train()
 
-    for step in range(TRAIN_STEPS):
-        lr = get_lr(step)
-        for g in optimizer.param_groups: g['lr'] = lr
-        optimizer.zero_grad(set_to_none=True); accum_loss = 0.0
-        for _ in range(GRAD_ACCUM):
-            batch = sample_doc_batch(train_np, train_chunks, BATCH_SIZE, SEQ_LEN, DEVICE)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = mdlm_loss(model, batch) / GRAD_ACCUM
-            loss.backward(); accum_loss += loss.item()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step(); losses.append(accum_loss)
-        loss_log["train_steps"].append(step)
-        loss_log["train_losses"].append(float(accum_loss))
-        if step % 100 == 0:
-            model.eval()
-            with torch.no_grad():
-                val_batch = sample_doc_batch(val_np, val_chunks, BATCH_SIZE * GRAD_ACCUM, SEQ_LEN, DEVICE)
+    for group in range(n_groups):
+        if ROTATE_SHARDS:
+            train_loader.load_group(group)
+        for step in range(TRAIN_STEPS):
+            lr = get_lr(step)
+            for g in optimizer.param_groups: g['lr'] = lr
+            optimizer.zero_grad(set_to_none=True); accum_loss = 0.0
+            for _ in range(GRAD_ACCUM):
+                if ROTATE_SHARDS:
+                    batch = train_loader.sample_batch(BATCH_SIZE, DEVICE)
+                else:
+                    batch = sample_doc_batch(train_np, train_chunks, BATCH_SIZE, SEQ_LEN, DEVICE)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    val_loss = mdlm_loss(model, val_batch).item()
-            model.train()
-            loss_log["val_steps"].append(step)
-            loss_log["val_losses"].append(float(val_loss))
-            avg     = np.mean(losses[-100:])
-            elapsed = time.time() - t0
-            tok_s   = (step+1)*BATCH_SIZE*GRAD_ACCUM*SEQ_LEN/elapsed
-            print(f"  step {step:5d}/{TRAIN_STEPS} | loss={avg:.4f} | val={val_loss:.4f} | lr={lr:.1e} | {tok_s/1e3:.0f}K tok/s | {elapsed:.0f}s", flush=True)
+                    loss = mdlm_loss(model, batch) / GRAD_ACCUM
+                loss.backward(); accum_loss += loss.item()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step(); losses.append(accum_loss)
+            loss_log["train_steps"].append(global_step)
+            loss_log["train_losses"].append(float(accum_loss))
+            if step % 1 == 0:
+                model.eval()
+                with torch.no_grad():
+                    val_batch = sample_doc_batch(val_np, val_chunks, BATCH_SIZE * GRAD_ACCUM, SEQ_LEN, DEVICE)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        val_loss = mdlm_loss(model, val_batch).item()
+                model.train()
+                loss_log["val_steps"].append(global_step)
+                loss_log["val_losses"].append(float(val_loss))
+                avg     = np.mean(losses[-100:])
+                elapsed = time.time() - t0
+                tok_s   = (global_step+1)*BATCH_SIZE*GRAD_ACCUM*SEQ_LEN/elapsed
+                print(f"  [g{group}/{n_groups} s{step}/{TRAIN_STEPS}] gs={global_step} | loss={avg:.4f} | val={val_loss:.4f} | lr={lr:.1e} | {tok_s/1e3:.0f}K tok/s | {elapsed:.0f}s", flush=True)
+            global_step += 1
 
     train_time = time.time() - t0
     print(f"\nTraining done: {train_time/60:.1f}m, loss={np.mean(losses[-100:]):.4f}", flush=True)
@@ -361,7 +412,7 @@ def main():
     bpb = total_bits / (total_content * 4.3)
     print(f"\n{'='*60}")
     print(f"  VARIATIONAL BPB: {bpb:.4f}")
-    print(f"  PR #820 MDLM:    1.625")
+    print(f"  PR #820 MDLM:    1.1625")
     print(f"  PR #888 MDLM:    1.1465")
     print(f"  AR baseline:     1.22")
     print(f"{'='*60}", flush=True)
