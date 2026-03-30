@@ -2,6 +2,11 @@
 Masked Diffusion Language Model (MDLM) for OpenAI Parameter Golf.
 Bidirectional transformer with log-linear noise schedule, adaLN timestep
 conditioning, and discrete absorbing-mask ELBO evaluation.
+
+EOS learning: token 1 (<s> in SP1024) marks document boundaries.
+EOS positions are never masked — they serve as visible anchors.
+Positions after EOS are filled with PAD_ID (1025), also never masked,
+and excluded from loss via content_mask.
 """
 import os, math, time, json
 import numpy as np
@@ -9,14 +14,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-VOCAB_SIZE = 1024; MASK_ID = 1024; TOTAL_VOCAB = 1025; PADDED_VOCAB = 1088
+VOCAB_SIZE  = 1024
+MASK_ID     = 1024
+EOS_ID      = 1       # <s> in SP1024 = document boundary marker
+PAD_ID      = 1025    # dedicated padding token; never masked, never in loss
+TOTAL_VOCAB = 1026    # real(1024) + MASK(1) + PAD(1)
+PADDED_VOCAB = 1088   # embedding table size (unchanged, has headroom)
 DEVICE = "cuda"; SEED = 42
 
 NUM_LAYERS = 11; MODEL_DIM = 512; NUM_HEADS = 8; MLP_MULT = 3.0
 SEQ_LEN = 2048; BATCH_SIZE = 8; GRAD_ACCUM = 4
-TRAIN_STEPS = 6000; LR = 6e-4; WARMUP_STEPS = 300; WARMDOWN_STEPS = 1500
+
+TRAIN_STEPS = 6000
+LR = 6e-4
+WARMUP_STEPS = 300
+WARMDOWN_STEPS = 1500
+
 NOISE_EPS = 1e-3
 VAR_EVAL_STEPS = 128  # higher = tighter bound
+
+DATA_DIR         = "data/datasets/fineweb10B_sp1024"
+MAX_TRAIN_SHARDS = 1  # set 0 to load all shards (80 = ~16 GB)
 
 torch.manual_seed(SEED); np.random.seed(SEED)
 NEG_INF = -1e6
@@ -112,11 +130,16 @@ class DiffusionLM(nn.Module):
         return logits
 
     def subs_log_probs(self, xt, sigma):
-        """MDLM substitution log probs with frozen visible tokens."""
+        """MDLM substitution log probs with frozen visible tokens.
+
+        Visible = any token that is not MASK_ID (includes EOS and PAD).
+        MASK_ID and PAD_ID are blocked from being predicted.
+        """
         logits = self.forward_logits(xt, sigma)
-        logits[:, :, MASK_ID] = NEG_INF  # can't predict MASK
+        logits[:, :, MASK_ID] = NEG_INF  # never predict MASK
+        logits[:, :, PAD_ID]  = NEG_INF  # never predict PAD
         logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-        # Visible tokens: identity (frozen)
+        # Visible tokens (content, EOS, PAD): freeze to identity
         frozen = torch.full_like(logits, NEG_INF)
         frozen.scatter_(-1, xt[..., None], 0.0)
         visible = (xt != MASK_ID)[..., None]
@@ -132,49 +155,61 @@ def mdlm_loss(model, x0):
 
     sigma, alpha = log_linear_noise(t)
     move_chance = 1 - alpha
-    # Mask tokens
-    move = torch.rand_like(x0.float()) < move_chance[:, None]
+
+    # EOS and PAD are always visible — never enter the masked diffusion process
+    is_special = (x0 == EOS_ID) | (x0 == PAD_ID)
+    move = (torch.rand_like(x0.float()) < move_chance[:, None]) & ~is_special
     xt = torch.where(move, MASK_ID, x0)
 
     log_probs = model.subs_log_probs(xt, sigma)
-    log_p_x0 = torch.gather(log_probs, -1, x0[..., None]).squeeze(-1)
+    # PAD positions: gather at a safe index (0) to avoid -inf * 0 = nan
+    x0_safe = x0.masked_fill(x0 == PAD_ID, 0)
+    log_p_x0 = torch.gather(log_probs, -1, x0_safe[..., None]).squeeze(-1)
 
-    # dsigma = (1-eps) / (1 - (1-eps)*t)
     dsigma = (1 - NOISE_EPS) / alpha
 
-    is_masked = (xt == MASK_ID).float()
-    loss = (dsigma[:, None] * (-log_p_x0) * is_masked).sum() / (B * x0.shape[1])
+    is_masked    = (xt == MASK_ID).float()
+    content_mask = (x0 != PAD_ID).float()  # 1 for real tokens + EOS, 0 for PAD
+
+    n_content = content_mask.sum().clamp(min=1)
+    loss = (dsigma[:, None] * (-log_p_x0) * is_masked * content_mask).sum() / n_content
     return loss
 
 
-# ─── Discrete ELBO eval (from PR #820) ───
+# ─── Discrete ELBO eval ───
 @torch.no_grad()
 def variational_elbo_bits(model, x0, n_steps=128):
     """Proper discrete absorbing-mask ELBO. Returns total bits for the batch."""
     B, L = x0.shape
     total_bits = torch.zeros(B, device=x0.device)
 
+    is_special   = (x0 == EOS_ID) | (x0 == PAD_ID)
+    content_mask = (x0 != PAD_ID).float()           # [B, L]
+    x0_safe      = x0.masked_fill(x0 == PAD_ID, 0)  # safe gather index
+
     t_grid = torch.arange(1, n_steps+1, device=x0.device, dtype=torch.float32) / n_steps
     sigma_grid, alpha_grid = log_linear_noise(t_grid)
 
-    # Terminal KL
-    alpha_T = alpha_grid[-1]
-    total_bits += L * float(alpha_T) * math.log(VOCAB_SIZE) / math.log(2.0)
+    # Terminal KL: only over content positions (not PAD)
+    alpha_T   = alpha_grid[-1]
+    n_content = content_mask.sum(dim=-1)  # [B]
+    total_bits += n_content * float(alpha_T) * math.log(VOCAB_SIZE) / math.log(2.0)
 
     alpha_prev = 1.0
     for step in range(n_steps):
-        alpha_curr = alpha_grid[step]
-        sigma_curr = sigma_grid[step].expand(B)
+        alpha_curr  = alpha_grid[step]
+        sigma_curr  = sigma_grid[step].expand(B)
         move_chance = 1 - alpha_curr
 
-        xt = torch.where(torch.rand_like(x0.float()) < move_chance, MASK_ID, x0)
+        move = (torch.rand_like(x0.float()) < move_chance) & ~is_special
+        xt   = torch.where(move, MASK_ID, x0)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             log_probs = model.subs_log_probs(xt, sigma_curr)
-        log_p_x0 = torch.gather(log_probs.float(), -1, x0[..., None]).squeeze(-1)
+        log_p_x0 = torch.gather(log_probs.float(), -1, x0_safe[..., None]).squeeze(-1)
 
         reveal_prob = (alpha_prev - float(alpha_curr)) / max(1.0 - float(alpha_curr), 1e-12)
-        is_masked = (xt == MASK_ID).float()
-        step_bits = reveal_prob * (-log_p_x0) * is_masked / math.log(2.0)
+        is_masked   = (xt == MASK_ID).float()
+        step_bits   = reveal_prob * (-log_p_x0) * is_masked * content_mask / math.log(2.0)
         total_bits += step_bits.sum(dim=-1)
 
         alpha_prev = float(alpha_curr)
@@ -183,14 +218,63 @@ def variational_elbo_bits(model, x0, n_steps=128):
 
 
 # ─── Data ───
+def _load_shard(path):
+    with open(path, "rb") as f:
+        f.read(256 * 4)  # skip header
+        return np.frombuffer(f.read(), dtype=np.uint16).astype(np.int64)
+
+
 def load_tokens(split):
-    for base in [os.path.expanduser("~/data"), "data"]:
-        path = os.path.join(base, f"fineweb_{split}_sp1024.bin")
-        if os.path.exists(path):
-            with open(path,"rb") as f:
-                f.read(256*4)
-                return torch.from_numpy(np.frombuffer(f.read(),dtype=np.uint16).astype(np.int64))
-    raise FileNotFoundError("No data")
+    import glob
+    pattern = os.path.join(DATA_DIR, f"fineweb_{split}_*.bin")
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(f"No shards found: {pattern}")
+    if split == "train" and MAX_TRAIN_SHARDS > 0:
+        paths = paths[:MAX_TRAIN_SHARDS]
+    print(f"  Loading {len(paths)} {split} shard(s)...", flush=True)
+    return np.concatenate([_load_shard(p) for p in paths])
+
+
+def build_chunk_index(tokens_np, seq_len):
+    """
+    Split every document into contiguous chunks of at most seq_len tokens.
+
+    Each document runs from one EOS_ID (exclusive) to the next (inclusive).
+    Short docs  (≤ seq_len): one chunk — content + closing EOS.
+    Long docs   (> seq_len): N full chunks of exactly seq_len (no EOS),
+                             followed by one tail chunk ending at EOS.
+
+    Returns a list of (start, end) pairs with end - start <= seq_len.
+    Chunks that include the closing EOS will get PAD fill in sample_doc_batch;
+    mid-doc chunks fill the full seq_len with no PAD needed.
+    """
+    eos_positions = np.where(tokens_np == EOS_ID)[0]
+    chunks = []
+    for k in range(len(eos_positions) - 1):
+        start   = int(eos_positions[k]) + 1   # first content token
+        end_eos = int(eos_positions[k + 1])   # closing EOS position (inclusive)
+        pos = start
+        while pos < end_eos + 1:
+            chunk_end = min(pos + seq_len, end_eos + 1)
+            chunks.append((pos, chunk_end))
+            pos = chunk_end
+    return chunks
+
+
+def sample_doc_batch(tokens_np, chunks, batch_size, seq_len, device):
+    """
+    Sample batch_size chunks uniformly at random.
+    Chunks shorter than seq_len (those ending at EOS) are right-padded with PAD_ID.
+    """
+    ki    = np.random.randint(0, len(chunks), size=batch_size)
+    batch = np.full((batch_size, seq_len), PAD_ID, dtype=np.int64)
+    for b, k in enumerate(ki):
+        start, end = chunks[k]
+        length = end - start
+        batch[b, :length] = tokens_np[start:end]
+    return torch.from_numpy(batch).to(device)
+
 
 def get_lr(step):
     if step < WARMUP_STEPS: return LR * (step+1)/WARMUP_STEPS
@@ -203,21 +287,26 @@ def get_lr(step):
 # ─── Main ───
 def main():
     print("="*60)
-    print("  LLaDA v4: MDLM training + discrete ELBO eval")
+    print("  LLaDA v5: MDLM + EOS learning + post-EOS zeroing")
     print("="*60, flush=True)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    train_tokens = load_tokens("train"); val_tokens = load_tokens("val")
-    print(f"Train: {train_tokens.numel():,}, Val: {val_tokens.numel():,}")
+    train_np     = load_tokens("train")
+    val_np       = load_tokens("val")
+    train_chunks = build_chunk_index(train_np, SEQ_LEN)
+    n_docs = len(np.where(train_np == EOS_ID)[0])
+    print(f"Train: {len(train_np):,} tokens, {n_docs:,} documents, {len(train_chunks):,} chunks")
+    print(f"Val:   {len(val_np):,} tokens")
 
     model = DiffusionLM().to(DEVICE).to(torch.bfloat16)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {NUM_LAYERS}L {MODEL_DIM}d {NUM_HEADS}h — {n_params:,} params")
-    print(f"Training: MDLM loss, log-linear noise, adaLN, antithetic sampling")
+    print(f"EOS_ID={EOS_ID} never masked; PAD_ID={PAD_ID} always visible, excluded from loss")
     print(f"Eval: discrete ELBO ({VAR_EVAL_STEPS} steps)\n", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9,0.95), weight_decay=0.1, fused=True)
-    n_train = train_tokens.numel(); t0 = time.time(); losses = []
+    val_chunks = build_chunk_index(val_np, SEQ_LEN)
+    t0 = time.time(); losses = []
     model.train()
 
     for step in range(TRAIN_STEPS):
@@ -225,49 +314,53 @@ def main():
         for g in optimizer.param_groups: g['lr'] = lr
         optimizer.zero_grad(set_to_none=True); accum_loss = 0.0
         for _ in range(GRAD_ACCUM):
-            idx = torch.randint(0, n_train-SEQ_LEN, (BATCH_SIZE,))
-            batch = torch.stack([train_tokens[i:i+SEQ_LEN] for i in idx]).to(DEVICE)
+            batch = sample_doc_batch(train_np, train_chunks, BATCH_SIZE, SEQ_LEN, DEVICE)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = mdlm_loss(model, batch) / GRAD_ACCUM
             loss.backward(); accum_loss += loss.item()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step(); losses.append(accum_loss)
         if step % 100 == 0:
-            avg = np.mean(losses[-100:])
+            model.eval()
+            with torch.no_grad():
+                val_batch = sample_doc_batch(val_np, val_chunks, BATCH_SIZE * GRAD_ACCUM, SEQ_LEN, DEVICE)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    val_loss = mdlm_loss(model, val_batch).item()
+            model.train()
+            avg     = np.mean(losses[-100:])
             elapsed = time.time() - t0
-            tok_s = (step+1)*BATCH_SIZE*GRAD_ACCUM*SEQ_LEN/elapsed
-            print(f"  step {step:5d}/{TRAIN_STEPS} | loss={avg:.4f} | lr={lr:.1e} | {tok_s/1e3:.0f}K tok/s | {elapsed:.0f}s", flush=True)
+            tok_s   = (step+1)*BATCH_SIZE*GRAD_ACCUM*SEQ_LEN/elapsed
+            print(f"  step {step:5d}/{TRAIN_STEPS} | loss={avg:.4f} | val={val_loss:.4f} | lr={lr:.1e} | {tok_s/1e3:.0f}K tok/s | {elapsed:.0f}s", flush=True)
 
     train_time = time.time() - t0
     print(f"\nTraining done: {train_time/60:.1f}m, loss={np.mean(losses[-100:]):.4f}", flush=True)
-    torch.save(model.state_dict(), os.path.expanduser("~/llada_v4.pt"))
+    torch.save(model.state_dict(), os.path.expanduser("~/llada_v5.pt"))
 
-    # Discrete ELBO eval
+    # Discrete ELBO eval on fixed val slices (no PAD; EOS anchors visible naturally)
     print(f"\nDiscrete ELBO eval ({VAR_EVAL_STEPS} steps, 500 seqs)...", flush=True)
     model.eval()
-    total_bits = 0.0; total_tokens = 0
-    n_seqs = min(500, (val_tokens.numel()-1)//SEQ_LEN)
+    val_tokens  = torch.from_numpy(val_np)
+    total_bits  = 0.0; total_content = 0
+    n_seqs = min(500, (len(val_np)-1)//SEQ_LEN)
     for i in range(n_seqs):
-        x = val_tokens[i*SEQ_LEN:(i+1)*SEQ_LEN].unsqueeze(0).to(DEVICE)
+        x    = val_tokens[i*SEQ_LEN:(i+1)*SEQ_LEN].unsqueeze(0).to(DEVICE)
         bits = variational_elbo_bits(model, x, n_steps=VAR_EVAL_STEPS)
-        total_bits += bits.sum().item()
-        total_tokens += SEQ_LEN
+        total_bits    += bits.sum().item()
+        total_content += SEQ_LEN  # no PAD in fixed slices
         if (i+1) % 50 == 0:
-            # Approximate BPB: bits / (tokens * avg_bytes_per_token)
-            # SP1024 avg ~4.3 bytes per token
-            bpb = total_bits / (total_tokens * 4.3)
+            bpb = total_bits / (total_content * 4.3)
             print(f"  eval {i+1}/{n_seqs} | var_bpb≈{bpb:.4f}", flush=True)
 
-    bpb = total_bits / (total_tokens * 4.3)
+    bpb = total_bits / (total_content * 4.3)
     print(f"\n{'='*60}")
     print(f"  VARIATIONAL BPB: {bpb:.4f}")
     print(f"  PR #820 MDLM:    1.625")
-    print(f"  Our v2 MC ELBO:  2.41")
+    print(f"  Our v4 MDLM:     (see v4_results.json)")
     print(f"  AR baseline:     1.22")
     print(f"{'='*60}", flush=True)
 
     json.dump({"var_bpb": bpb, "params": n_params, "train_min": train_time/60,
                "var_eval_steps": VAR_EVAL_STEPS, "train_loss": float(np.mean(losses[-100:]))},
-              open(os.path.expanduser("~/v4_results.json"), "w"), indent=2)
+              open(os.path.expanduser("~/v5_results.json"), "w"), indent=2)
 
 if __name__ == "__main__": main()
