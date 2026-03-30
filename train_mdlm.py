@@ -26,7 +26,7 @@ DEVICE = "cuda"; SEED = 42
 NUM_LAYERS = 11; MODEL_DIM = 512; NUM_HEADS = 8; MLP_MULT = 3.0
 SEQ_LEN = 2048; BATCH_SIZE = 8; GRAD_ACCUM = 4
 
-TRAIN_STEPS = 5
+TRAIN_STEPS = 6000
 LR = 6e-4
 WARMUP_STEPS = 300 # Note: this is part of training steps
 WARMDOWN_STEPS = 1500
@@ -375,7 +375,7 @@ def main():
             optimizer.step(); losses.append(accum_loss)
             loss_log["train_steps"].append(global_step)
             loss_log["train_losses"].append(float(accum_loss))
-            if step % 1 == 0:
+            if step % 100 == 0:
                 model.eval()
                 with torch.no_grad():
                     val_batch = sample_doc_batch(val_np, val_chunks, BATCH_SIZE * GRAD_ACCUM, SEQ_LEN, DEVICE)
