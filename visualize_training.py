@@ -149,7 +149,8 @@ def post_training_visualizer(loss_log, results, model, val_np, sp,
     sp       : SentencePieceProcessor
     """
     if out_dir is None:
-        out_dir = "./viz"
+        from datetime import datetime
+        out_dir = os.path.join("./viz", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(out_dir, exist_ok=True)
     print(f"\nVisualizer: writing outputs to {out_dir}", flush=True)
 
