@@ -355,6 +355,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"  VARIATIONAL BPB: {bpb:.4f}")
     print(f"  PR #820 MDLM:    1.625")
+    print(f"  PR #888 MDLM:    1.1465")
     print(f"  Our v4 MDLM:     (see v4_results.json)")
     print(f"  AR baseline:     1.22")
     print(f"{'='*60}", flush=True)
