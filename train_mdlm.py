@@ -8,11 +8,12 @@ EOS positions are never masked — they serve as visible anchors.
 Positions after EOS are filled with PAD_ID (1025), also never masked,
 and excluded from loss via content_mask.
 """
-import os, math, time, json
+import glob, io, os, math, time, json, zlib
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sentencepiece as spm
 
 VOCAB_SIZE  = 1024
 MASK_ID     = 1024
@@ -35,6 +36,11 @@ VAR_EVAL_STEPS = 128  # higher = tighter bound
 
 DATA_DIR         = "data/datasets/fineweb10B_sp1024"
 MAX_TRAIN_SHARDS = 1  # set 0 to load all shards (80 = ~16 GB)
+TOKENIZER_PATH   = "data/tokenizers/fineweb_1024_bpe.model"
+EXPORT_PATH      = os.path.expanduser("~/llada_v5.bin")
+
+INT8_CLIP_Q      = 99.99984 / 100.0
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 
 torch.manual_seed(SEED); np.random.seed(SEED)
 NEG_INF = -1e6
@@ -284,6 +290,115 @@ def get_lr(step):
         return LR * (0.1 + 0.9*(0.5*(1+math.cos(math.pi*(1-progress)))))
 
 
+# ─── Post-training quantization (int8 per-row, zlib export) ───
+def _quantize_tensor(t):
+    """Per-row int8 for matrices, per-tensor int8 for vectors/scalars."""
+    t32 = t.float()
+    if t32.ndim == 2:
+        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1).clamp_min(1e-8)
+        clipped  = t32.clamp(-clip_abs[:, None], clip_abs[:, None])
+        scale    = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q        = clipped.div(scale[:, None]).round().clamp(-127, 127).to(torch.int8)
+        return q.contiguous(), scale.to(torch.float16).contiguous()
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale    = torch.tensor(max(clip_abs / 127.0, 1e-8))
+    q        = t32.clamp(-clip_abs, clip_abs).div(scale).round().clamp(-127, 127).to(torch.int8)
+    return q.contiguous(), scale
+
+
+def quantize_state_dict(state_dict):
+    quantized, scales, dtypes, passthrough = {}, {}, {}, {}
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu().contiguous()
+        if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            passthrough[name] = t.to(torch.float16) if t.is_floating_point() else t
+        else:
+            q, s = _quantize_tensor(t)
+            quantized[name] = q; scales[name] = s
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+    return {"quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
+
+
+def dequantize_state_dict(obj):
+    out = {}
+    for name, q in obj["quantized"].items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name].float()
+        if s.ndim > 0:  # per-row scale
+            out[name] = (q.float() * s[:, None]).to(dtype)
+        else:
+            out[name] = (q.float() * s.item()).to(dtype)
+    for name, t in obj["passthrough"].items():
+        out[name] = t.contiguous()
+    return out
+
+
+def export_model(model, path):
+    """Quantize → torch-serialize → zlib-compress → write to path."""
+    obj   = quantize_state_dict({k: v for k, v in model.state_dict().items()})
+    buf   = io.BytesIO()
+    torch.save(obj, buf)
+    blob  = zlib.compress(buf.getvalue(), level=9)
+    with open(path, "wb") as f:
+        f.write(blob)
+    raw_mb  = buf.tell() / 1e6
+    comp_mb = len(blob) / 1e6
+    print(f"  Exported: {raw_mb:.1f} MB → {comp_mb:.1f} MB (zlib-9) → {path}")
+    return comp_mb
+
+
+# ─── Competition BPB eval ───
+def build_sentencepiece_luts(sp, vocab_size, device):
+    """Byte-count lookup tables matching the competition's scoring."""
+    table_size = max(int(sp.vocab_size()), vocab_size)
+    base_bytes      = np.zeros(table_size, dtype=np.int16)
+    has_lead_space  = np.zeros(table_size, dtype=np.bool_)
+    is_boundary     = np.ones(table_size,  dtype=np.bool_)
+    for tid in range(int(sp.vocab_size())):
+        if sp.is_control(tid) or sp.is_unknown(tid) or sp.is_unused(tid):
+            continue
+        is_boundary[tid] = False
+        if sp.is_byte(tid):
+            base_bytes[tid] = 1; continue
+        piece = sp.id_to_piece(tid)
+        if piece.startswith("▁"):
+            has_lead_space[tid] = True; piece = piece[1:]
+        base_bytes[tid] = len(piece.encode("utf-8"))
+    return (torch.tensor(base_bytes,     dtype=torch.int16, device=device),
+            torch.tensor(has_lead_space, dtype=torch.bool,  device=device),
+            torch.tensor(is_boundary,    dtype=torch.bool,  device=device))
+
+
+@torch.no_grad()
+def competition_bpb_eval(model, val_np, sp, device, n_steps=VAR_EVAL_STEPS, max_seqs=500):
+    """
+    Compute competition val_bpb: ELBO bits / tokenizer bytes.
+    Uses the same sentencepiece byte-counting as train_gpt.py eval_val.
+    """
+    base_lut, space_lut, boundary_lut = build_sentencepiece_luts(sp, VOCAB_SIZE, device)
+    val_tokens = torch.from_numpy(val_np)
+    n_seqs     = min(max_seqs, (len(val_np) - 1) // SEQ_LEN)
+    total_bits = 0.0; total_bytes = 0.0
+
+    model.eval()
+    for i in range(n_seqs):
+        x        = val_tokens[i*SEQ_LEN:(i+1)*SEQ_LEN].to(device)
+        bits     = variational_elbo_bits(model, x.unsqueeze(0), n_steps=n_steps)
+        total_bits += bits.sum().item()
+
+        # Count bytes using tokenizer luts (competition formula)
+        tgt  = x                           # target tokens [L]
+        prev = torch.cat([x[:1], x[:-1]])  # previous tokens (for space detection)
+        tok_bytes = base_lut[tgt].to(torch.int16)
+        tok_bytes += (space_lut[tgt] & ~boundary_lut[prev]).to(torch.int16)
+        total_bytes += tok_bytes.float().sum().item()
+
+        if (i+1) % 50 == 0:
+            print(f"  bpb_eval {i+1}/{n_seqs} | bpb={total_bits/max(total_bytes,1):.4f}", flush=True)
+
+    return total_bits / max(total_bytes, 1.0)
+
+
 # ─── Main ───
 def main():
     print("="*60)
@@ -334,33 +449,28 @@ def main():
 
     train_time = time.time() - t0
     print(f"\nTraining done: {train_time/60:.1f}m, loss={np.mean(losses[-100:]):.4f}", flush=True)
-    torch.save(model.state_dict(), os.path.expanduser("~/llada_v5.pt"))
 
-    # Discrete ELBO eval on fixed val slices (no PAD; EOS anchors visible naturally)
-    print(f"\nDiscrete ELBO eval ({VAR_EVAL_STEPS} steps, 500 seqs)...", flush=True)
+    # ── Export (quantized + zlib) ──
+    print(f"\nExporting model to {EXPORT_PATH} ...", flush=True)
+    comp_mb = export_model(model, EXPORT_PATH)
+
+    # ── Competition BPB eval ──
+    print(f"\nCompetition BPB eval ({VAR_EVAL_STEPS} steps, up to 500 seqs)...", flush=True)
+    sp = spm.SentencePieceProcessor(model_file=TOKENIZER_PATH)
     model.eval()
-    val_tokens  = torch.from_numpy(val_np)
-    total_bits  = 0.0; total_content = 0
-    n_seqs = min(500, (len(val_np)-1)//SEQ_LEN)
-    for i in range(n_seqs):
-        x    = val_tokens[i*SEQ_LEN:(i+1)*SEQ_LEN].unsqueeze(0).to(DEVICE)
-        bits = variational_elbo_bits(model, x, n_steps=VAR_EVAL_STEPS)
-        total_bits    += bits.sum().item()
-        total_content += SEQ_LEN  # no PAD in fixed slices
-        if (i+1) % 50 == 0:
-            bpb = total_bits / (total_content * 4.3)
-            print(f"  eval {i+1}/{n_seqs} | var_bpb≈{bpb:.4f}", flush=True)
+    bpb = competition_bpb_eval(model, val_np, sp, DEVICE,
+                               n_steps=VAR_EVAL_STEPS, max_seqs=500)
 
-    bpb = total_bits / (total_content * 4.3)
     print(f"\n{'='*60}")
-    print(f"  VARIATIONAL BPB: {bpb:.4f}")
+    print(f"  COMPETITION BPB: {bpb:.4f}")
     print(f"  PR #820 MDLM:    1.625")
-    print(f"  Our v4 MDLM:     (see v4_results.json)")
     print(f"  AR baseline:     1.22")
+    print(f"  Export size:     {comp_mb:.1f} MB")
     print(f"{'='*60}", flush=True)
 
-    json.dump({"var_bpb": bpb, "params": n_params, "train_min": train_time/60,
-               "var_eval_steps": VAR_EVAL_STEPS, "train_loss": float(np.mean(losses[-100:]))},
+    json.dump({"val_bpb": bpb, "export_mb": comp_mb, "params": n_params,
+               "train_min": train_time/60, "var_eval_steps": VAR_EVAL_STEPS,
+               "train_loss": float(np.mean(losses[-100:]))},
               open(os.path.expanduser("~/v5_results.json"), "w"), indent=2)
 
 if __name__ == "__main__": main()
