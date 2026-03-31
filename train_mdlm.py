@@ -264,11 +264,19 @@ class ShardedDataLoader:
               f"{TRAIN_STEPS} steps/group → {TRAIN_STEPS * self.n_groups} total steps", flush=True)
 
     def load_group(self, group_idx):
+        import gc
+        # Free previous group before allocating the new one
+        self.tokens_np = None
+        self.chunks    = None
+        gc.collect()
+
         start       = group_idx * self.window
         batch_paths = self.paths[start:start + self.window]
         print(f"\n  [group {group_idx}/{self.n_groups}] Loading: "
               f"{[os.path.basename(p) for p in batch_paths]}", flush=True)
-        self.tokens_np = np.concatenate([_load_shard(p) for p in batch_paths])
+        shards         = [_load_shard(p) for p in batch_paths]
+        self.tokens_np = np.concatenate(shards)
+        del shards; gc.collect()
         self.chunks    = build_chunk_index(self.tokens_np, SEQ_LEN)
         print(f"  {len(self.tokens_np):,} tokens, {len(self.chunks):,} chunks", flush=True)
 
