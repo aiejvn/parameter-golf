@@ -389,13 +389,18 @@ def main():
                     val_batch = sample_doc_batch(val_np, val_chunks, BATCH_SIZE * GRAD_ACCUM, SEQ_LEN, DEVICE)
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         val_loss = mdlm_loss(model, val_batch).item()
+                    # 1-sequence ELBO sample for a quick bpb estimate
+                    bpb_x   = val_batch[:1]
+                    bits    = variational_elbo_bits(model, bpb_x, n_steps=16).sum().item()
+                    n_cont  = (bpb_x != PAD_ID).sum().item()
+                    bpb_est = bits / max(n_cont * 4.3, 1)
                 model.train()
                 loss_log["val_steps"].append(global_step)
                 loss_log["val_losses"].append(float(val_loss))
                 avg     = np.mean(losses[-100:])
                 elapsed = time.time() - t0
                 tok_s   = (global_step+1)*BATCH_SIZE*GRAD_ACCUM*SEQ_LEN/elapsed
-                print(f"  [g{group}/{n_groups} s{step}/{TRAIN_STEPS}] gs={global_step} | loss={avg:.4f} | val={val_loss:.4f} | lr={lr:.1e} | {tok_s/1e3:.0f}K tok/s | {elapsed:.0f}s", flush=True)
+                print(f"  [g{group}/{n_groups} s{step}/{TRAIN_STEPS}] gs={global_step} | loss={avg:.4f} | val={val_loss:.4f} | bpb~{bpb_est:.3f} | lr={lr:.1e} | {tok_s/1e3:.0f}K tok/s | {elapsed:.0f}s", flush=True)
             global_step += 1
 
     train_time = time.time() - t0
