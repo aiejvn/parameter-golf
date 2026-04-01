@@ -331,12 +331,17 @@ def train_one_config(n_heads, train_source, val_np, val_chunks):
                     val_batch = sample_doc_batch(val_np, val_chunks, BATCH_SIZE * GRAD_ACCUM, DEVICE)
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         val_loss = mdlm_loss(model, val_batch).item()
+                    # 1-sequence ELBO sample for a quick bpb estimate
+                    bpb_x   = val_batch[:1]
+                    bits    = variational_elbo_bits(model, bpb_x, n_steps=16).sum().item()
+                    n_cont  = (bpb_x != PAD_ID).sum().item()
+                    bpb_est = bits / max(n_cont * 4.3, 1)
                 model.train()
                 avg     = float(np.mean(losses[-200:]))
                 elapsed = time.time() - t0
                 tok_s   = (global_step+1)*BATCH_SIZE*GRAD_ACCUM*SEQ_LEN/elapsed
                 print(f"  [g{group}/{n_groups} s{step}/{TRAIN_STEPS}] gs={global_step} | "
-                      f"loss={avg:.4f} | val={val_loss:.4f} | {tok_s/1e3:.0f}K tok/s | "
+                      f"loss={avg:.4f} | val={val_loss:.4f} | bpb~{bpb_est:.3f} | {tok_s/1e3:.0f}K tok/s | "
                       f"lr={lr:.1e} | {elapsed:.0f}s", flush=True)
             global_step += 1
 
