@@ -25,7 +25,7 @@ DEVICE       = "cuda"; SEED = 42
 NUM_LAYERS = 11; MODEL_DIM = 512; NUM_HEADS = 8; MLP_MULT = 3.0
 SEQ_LEN    = 2048; GRAD_ACCUM = 4
 
-TRAIN_STEPS    = 6000
+TRAIN_STEPS    = 401
 WARMUP_STEPS   = 300
 WARMDOWN_STEPS = 1500
 
@@ -238,13 +238,9 @@ def build_optimizer(model, opt_name, lr):
                                   weight_decay=0.1, fused=True)], None
 
     # Muon: 2-D block matrices → Muon; everything else → Adam
-    block_named = list(model.blocks.named_parameters())
-    matrix_params = [p for _, p in block_named if p.ndim == 2]
-    other_ids     = {id(p) for _, p in block_named if p.ndim != 2}
-    other_ids    |= {id(p) for p in model.wte.parameters()}
-    other_ids    |= {id(p) for p in model.sigma_map.parameters()}
-    other_ids    |= {id(p) for p in model.head.parameters()}
-    scalar_params = [p for p in model.parameters() if id(p) in other_ids]
+    matrix_params = [p for _, p in model.blocks.named_parameters() if p.ndim == 2]
+    matrix_ids    = {id(p) for p in matrix_params}
+    scalar_params = [p for p in model.parameters() if id(p) not in matrix_ids]
 
     opt_muon  = Muon(matrix_params, lr=lr, momentum=MUON_MOMENTUM,
                      backend_steps=MUON_BACKEND_STEPS)
@@ -270,7 +266,7 @@ def train_one_config(lr, batch_size, opt_name, train_np, train_chunks, val_np, v
     print(f"  lr={lr:.0e}  batch={batch_size}  eff_batch={eff_batch}  opt={opt_name}  params={n_params:,}", flush=True)
     print(f"{'='*60}", flush=True)
 
-    optimizers, scalar_lr = build_optimizer(model, opt_name, lr)
+    optimizers, _ = build_optimizer(model, opt_name, lr)
     t0 = time.time(); losses = []
     model.train()
 

@@ -1,0 +1,1 @@
+lr,batch_size,eff_batch,optimizer,params,train_loss,val_loss,val_bpb,train_min
