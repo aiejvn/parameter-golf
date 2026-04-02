@@ -41,7 +41,7 @@ MUON_BACKEND_STEPS = 5
 
 # ── sweep grid ────────────────────────────────────────────────────────────────
 SWEEP_LR         = [1e-4, 3e-4, 6e-4, 1e-3, 3e-3]
-SWEEP_BATCH_SIZE = [4, 8, 16, 32, 128, 512, 1024]
+SWEEP_BATCH_SIZE = [4, 8, 16, 32, 128, 256, 512]
 SWEEP_OPTIMIZER  = ["adamw", "muon"]
 
 torch.manual_seed(SEED); np.random.seed(SEED)
