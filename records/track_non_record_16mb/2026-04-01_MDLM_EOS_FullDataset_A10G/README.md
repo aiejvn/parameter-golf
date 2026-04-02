@@ -14,8 +14,6 @@ via shard rotation, and the first to learn document-boundary structure (EOS toke
 | PR #1106 (MDLM, prior best diffusion) | 1.1465 |
 | AR baseline | 1.2244 |
 
-Training loss at end of run: 31.57 | Total training time: **1267 minutes** (1x A10G)
-
 ## Why Non-Record
 
 Trained on 1x AWS A10G (24GB VRAM). The competition requires 8xH100 SXM within a
