@@ -85,7 +85,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-
+    
     # Medusa auxiliary heads (training-only, stripped before export).
     num_medusa_heads = int(os.environ.get("NUM_MEDUSA_HEADS", 0))
     medusa_weight = float(os.environ.get("MEDUSA_WEIGHT", 0.1))
@@ -823,10 +823,10 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
-        console=False,
-    )
+    # log0(
+    #     subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+    #     console=False,
+    # )
     log0("=" * 100, console=False)
 
     # -----------------------------
