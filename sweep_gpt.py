@@ -91,6 +91,11 @@ class Hyperparameters:
     medusa_weight = float(os.environ.get("MEDUSA_WEIGHT", 0.1))
     medusa_lr_mult = float(os.environ.get("MEDUSA_LR_MULT", 1.0))
 
+    # Latent transition: predicts next encoder skip from current (training-only).
+    latent_transition_weight = float(os.environ.get("LATENT_TRANSITION_WEIGHT", 0.0))
+    # Cycle consistency: reconstructs input embedding x0 from final hidden state (training-only).
+    cycle_weight = float(os.environ.get("CYCLE_WEIGHT", 0.0))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -634,6 +639,41 @@ class MedusaHead(nn.Module):
         return self.linear(x)
 
 
+class LatentTransitionHead(nn.Module):
+    # Bottleneck projection: D -> D//4 -> D//4.
+    # Encodes skip[i] to a compressed latent and predicts the latent of skip[i+1].
+    # Loss is MSE in latent space between predicted and target (detached) projections.
+    # Stripped before export.
+    def __init__(self, dim: int):
+        super().__init__()
+        latent_dim = dim // 4
+        self.encode = CastedLinear(dim, latent_dim, bias=False)
+        self.predict = CastedLinear(latent_dim, latent_dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.predict(self.encode(x))
+
+    def encode_target(self, x: Tensor) -> Tensor:
+        return self.encode(x)
+
+
+class CycleConsistencyHead(nn.Module):
+    # Bottleneck projection: D -> D//4 -> D//4.
+    # Encodes x_final to a latent and reconstructs the latent of x0.
+    # Loss is MSE in latent space; stripped before export.
+    def __init__(self, dim: int):
+        super().__init__()
+        latent_dim = dim // 4
+        self.encode = CastedLinear(dim, latent_dim, bias=False)
+        self.predict = CastedLinear(latent_dim, latent_dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.predict(self.encode(x))
+
+    def encode_target(self, x: Tensor) -> Tensor:
+        return self.encode(x)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -678,6 +718,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         num_medusa_heads: int = 0,
         medusa_weight: float = 0.1,
+        latent_transition_weight: float = 0.0,
+        cycle_weight: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -686,6 +728,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.medusa_weight = medusa_weight
+        self.latent_transition_weight = latent_transition_weight
+        self.cycle_weight = cycle_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -711,6 +755,15 @@ class GPT(nn.Module):
         self.medusa_heads = nn.ModuleList(
             [MedusaHead(model_dim, vocab_size) for _ in range(num_medusa_heads)]
         )
+        # num_encoder_layers-1 transition heads: skip[i] -> skip[i+1]
+        num_transitions = max(self.num_encoder_layers - 1, 0)
+        self.latent_transition_heads = nn.ModuleList(
+            [LatentTransitionHead(model_dim) for _ in range(num_transitions)]
+            if latent_transition_weight > 0.0 else []
+        )
+        self.cycle_heads = nn.ModuleList(
+            [CycleConsistencyHead(model_dim)] if cycle_weight > 0.0 else []
+        )
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -727,15 +780,17 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
+        # Keep encoder_skips separately for latent transition loss.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+        encoder_skips = list(skips)  # shallow copy before decoder pops
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x)  # [B, T, D] — keep shape for Medusa heads
+        x = self.final_norm(x)  # [B, T, D] — keep shape for aux heads
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -746,18 +801,40 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        if not (self.training and len(self.medusa_heads) > 0):
+
+        if not self.training:
             return main_loss
-        # Each head i predicts tokens i+1 steps ahead of the main head.
-        # Head 0: predicts t+2, using positions [0, T-1) against targets [1, T).
-        # Head 1: predicts t+3, using positions [0, T-2) against targets [2, T). etc.
-        aux_loss = main_loss.new_zeros(())
-        for step_offset, head in enumerate(self.medusa_heads, start=1):
-            x_trim = x[:, :-step_offset].reshape(-1, x.size(-1))
-            tgt_trim = target_ids[:, step_offset:].reshape(-1)
-            h_logits = self.logit_softcap * torch.tanh(head(x_trim) / self.logit_softcap)
-            aux_loss = aux_loss + F.cross_entropy(h_logits.float(), tgt_trim, reduction="mean")
-        return main_loss + self.medusa_weight * (aux_loss / len(self.medusa_heads))
+
+        total_loss = main_loss
+
+        # Medusa: each head i predicts tokens i+1 steps ahead.
+        if len(self.medusa_heads) > 0:
+            aux = main_loss.new_zeros(())
+            for step_offset, head in enumerate(self.medusa_heads, start=1):
+                x_trim = x[:, :-step_offset].reshape(-1, x.size(-1))
+                tgt_trim = target_ids[:, step_offset:].reshape(-1)
+                h_logits = self.logit_softcap * torch.tanh(head(x_trim) / self.logit_softcap)
+                aux = aux + F.cross_entropy(h_logits.float(), tgt_trim, reduction="mean")
+            total_loss = total_loss + self.medusa_weight * (aux / len(self.medusa_heads))
+
+        # Latent transition: head[i] maps skip[i] -> latent, predicts latent of skip[i+1].
+        if len(self.latent_transition_heads) > 0:
+            aux = main_loss.new_zeros(())
+            for i, head in enumerate(self.latent_transition_heads):
+                pred = head(encoder_skips[i].reshape(-1, encoder_skips[i].size(-1)))
+                target_latent = head.encode_target(encoder_skips[i + 1].reshape(-1, encoder_skips[i + 1].size(-1))).detach()
+                aux = aux + F.mse_loss(pred.float(), target_latent.float())
+            total_loss = total_loss + self.latent_transition_weight * (aux / len(self.latent_transition_heads))
+
+        # Cycle consistency: reconstruct latent of x0 from final hidden state.
+        if len(self.cycle_heads) > 0:
+            head = self.cycle_heads[0] # Note: usually one layer. May be more if needed.
+            x0_flat = x0.reshape(-1, x0.size(-1))
+            pred = head(x_flat)
+            target_latent = head.encode_target(x0_flat).detach()
+            total_loss = total_loss + self.cycle_weight * F.mse_loss(pred.float(), target_latent.float())
+
+        return total_loss
 
 
 # -----------------------------
@@ -873,6 +950,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         num_medusa_heads=args.num_medusa_heads,
         medusa_weight=args.medusa_weight,
+        latent_transition_weight=args.latent_transition_weight,
+        cycle_weight=args.cycle_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -940,6 +1019,20 @@ def main() -> None:
         for group in optimizer_medusa.param_groups:
             group["base_lr"] = medusa_lr
         optimizers.append(optimizer_medusa)
+    aux_matrix_params = (
+        [p for p in base_model.latent_transition_heads.parameters() if p.ndim == 2]
+        + [p for p in base_model.cycle_heads.parameters() if p.ndim == 2]
+    )
+    if aux_matrix_params:
+        optimizer_aux = Muon(
+            aux_matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+        for group in optimizer_aux.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizers.append(optimizer_aux)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -958,6 +1051,7 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
     log0(f"medusa:num_heads:{args.num_medusa_heads} weight:{args.medusa_weight} lr_mult:{args.medusa_lr_mult}")
+    log0(f"latent_transition:weight:{args.latent_transition_weight} cycle:weight:{args.cycle_weight}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1115,10 +1209,11 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    # Strip Medusa heads: they are training-only auxiliaries and must not be exported.
-    # Replacing with an empty ModuleList ensures state_dict() and strict load_state_dict() both work.
-    if len(base_model.medusa_heads) > 0:
-        base_model.medusa_heads = nn.ModuleList([])
+    # Strip all training-only auxiliary heads before export.
+    # Empty ModuleList keeps the state_dict keys present so strict load_state_dict() works.
+    base_model.medusa_heads = nn.ModuleList([])
+    base_model.latent_transition_heads = nn.ModuleList([])
+    base_model.cycle_heads = nn.ModuleList([])
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1185,53 +1280,108 @@ def main() -> None:
 # state are fully isolated between runs. Logs land in logs/<run_id>.txt where
 # run_id encodes the hyperparameters for easy parsing.
 
+def _parse_exact_val_bpb(logfile: str) -> str:
+    """Extract val_bpb from the final_int8_zlib_roundtrip_exact line (8 d.p.)."""
+    import re
+    try:
+        with open(logfile, encoding="utf-8") as f:
+            for line in f:
+                if "final_int8_zlib_roundtrip_exact" in line:
+                    m = re.search(r"val_bpb:([\d.eE+\-]+)", line)
+                    if m:
+                        return m.group(1)
+    except FileNotFoundError:
+        pass
+    return ""
+
+
 def sweep() -> None:
+    import csv
     import itertools
 
-    # Grid definition
-    ks           = [1, 2, 3]
-    weights      = [0.1, 0.5, 0.9, 5.0]
-    lr_mults     = [1.0, 2.0]
+    # Grid definition — 0/0.0 entries serve as the per-axis baselines.
+    ks           = [0, 1, 3]            # Medusa heads (0 = off)
+    weights      = [0.0, 0.5, 5.0]     # Medusa head weights
+    lr_mults     = [1.0, 2.0]           # Learning rate multiplier for Medusa heads
+    lt_weights   = [0.0, 0.01, 0.1]    # Latent transition weights (0.0 = off)
+    cyc_weights  = [0.0, 0.01, 0.1]    # Cycle consistency weights (0.0 = off)
 
-    # Baseline first (no Medusa heads), then all combinations
-    configs: list[dict[str, str]] = [{"NUM_MEDUSA_HEADS": "0"}]
-    for k, w, lm in itertools.product(ks, weights, lr_mults):
+    seen: set[tuple] = set()
+    configs: list[dict[str, str]] = []
+    for k, w, lm, lt, cy in itertools.product(ks, weights, lr_mults, lt_weights, cyc_weights):
+        # When k=0, medusa_weight and lr_mult are irrelevant — collapse duplicates.
+        eff_w  = w  if k > 0 else 0.0
+        eff_lm = lm if k > 0 else 1.0
+        key = (k, eff_w, eff_lm, lt, cy)
+        if key in seen:
+            continue
+        seen.add(key)
         configs.append({
-            "NUM_MEDUSA_HEADS": str(k),
-            "MEDUSA_WEIGHT":    str(w),
-            "MEDUSA_LR_MULT":   str(lm),
+            "NUM_MEDUSA_HEADS":         str(k),
+            "MEDUSA_WEIGHT":            str(eff_w),
+            "MEDUSA_LR_MULT":           str(eff_lm),
+            "LATENT_TRANSITION_WEIGHT": str(lt),
+            "CYCLE_WEIGHT":             str(cy),
         })
 
-    script = Path(__file__).resolve()
-    total  = len(configs)
-    print(f"sweep: {total} runs  ({total - 1} medusa + 1 baseline)")
+    script   = Path(__file__).resolve()
+    csv_path = Path("logs/sweep_results.csv")
+    csv_path.parent.mkdir(exist_ok=True)
+    total    = len(configs)
+    print(f"sweep: {total} runs")
+    print(f"results -> {csv_path}")
+
+    csv_fields = ["run_id", "status", "elapsed_s",
+                  "num_medusa_heads", "medusa_weight", "medusa_lr_mult",
+                  "latent_transition_weight", "cycle_weight",
+                  "q_val_bpb"]
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    writer   = csv.DictWriter(csv_file, fieldnames=csv_fields)
+    writer.writeheader()
+    csv_file.flush()
 
     for idx, cfg in enumerate(configs, start=1):
-        # Build a human-readable run_id so log filenames are self-describing
-        if cfg["NUM_MEDUSA_HEADS"] == "0":
-            tag = "baseline"
-        else:
-            tag = (
-                f"k{cfg['NUM_MEDUSA_HEADS']}"
-                f"_w{cfg['MEDUSA_WEIGHT']}"
-                f"_lr{cfg['MEDUSA_LR_MULT']}"
-            )
-        run_id = tag
+        k  = cfg["NUM_MEDUSA_HEADS"]
+        w  = cfg["MEDUSA_WEIGHT"]
+        lm = cfg["MEDUSA_LR_MULT"]
+        lt = cfg["LATENT_TRANSITION_WEIGHT"]
+        cy = cfg["CYCLE_WEIGHT"]
+        parts = []
+        if k  != "0":   parts.append(f"med_k{k}_w{w}_lr{lm}")
+        if lt != "0.0": parts.append(f"lt{lt}")
+        if cy != "0.0": parts.append(f"cy{cy}")
+        tag     = "_".join(parts) if parts else "baseline"
+        run_id  = tag
+        logfile = f"logs/{run_id}.txt"
 
         env = {**os.environ, "RUN_ID": run_id, **cfg}
-        print(f"\n[{idx}/{total}] starting run_id={run_id}  cfg={cfg}")
+        print(f"\n[{idx}/{total}] starting run_id={run_id}  log={logfile}")
         t_start = time.perf_counter()
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            env=env,
-        )
+        result  = subprocess.run([sys.executable, str(script), "--single"], env=env)
         elapsed = time.perf_counter() - t_start
-        status = "OK" if result.returncode == 0 else f"FAILED(rc={result.returncode})"
-        print(f"[{idx}/{total}] {tag}: {status}  elapsed={elapsed:.0f}s")
+        status  = "ok" if result.returncode == 0 else f"failed_rc{result.returncode}"
+
+        q_val_bpb = _parse_exact_val_bpb(logfile)
+        writer.writerow({
+            "run_id":                   run_id,
+            "status":                   status,
+            "elapsed_s":                f"{elapsed:.1f}",
+            "num_medusa_heads":         k,
+            "medusa_weight":            w,
+            "medusa_lr_mult":           lm,
+            "latent_transition_weight": lt,
+            "cycle_weight":             cy,
+            "q_val_bpb":                q_val_bpb,
+        })
+        csv_file.flush()
+        print(f"[{idx}/{total}] {tag}: {status}  elapsed={elapsed:.0f}s  q_val_bpb={q_val_bpb}")
+
+    csv_file.close()
+    print(f"\nsweep complete. results in {csv_path}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--sweep":
-        sweep()
-    else:
+    if len(sys.argv) > 1 and sys.argv[1] == "--single":
         main()
+    else:
+        sweep()
