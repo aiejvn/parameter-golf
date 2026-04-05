@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-THREADS=$(( $(nproc) - 4 ))
-if [ "$THREADS" -lt 1 ]; then THREADS=1; fi
+THREADS=4
 
 echo "============================================================"
 echo "  Parameter Golf — Prepare + Sweep"
@@ -50,7 +49,7 @@ if [ "$SP4096_READY" -eq 0 ] || [ "$SP8192_READY" -eq 0 ]; then
     echo ""
 
     MATCHED_FINEWEB_TOKENIZER_THREADS=$THREADS \
-    MATCHED_FINEWEB_SP_BATCH_SIZE=4096 \
+    MATCHED_FINEWEB_SP_BATCH_SIZE=1024 \
     python data/download_hf_docs_and_tokenize.py \
         --output-root ./data \
         --tokenizer-config data/tokenizer_specs_4096_8192.json \
