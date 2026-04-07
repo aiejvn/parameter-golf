@@ -86,6 +86,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.0))
+    muon_wd = float(os.environ.get("MUON_WD", -1.0))  # -1 means inherit from weight_decay
     
     # Medusa auxiliary heads (training-only, stripped before export).
     num_medusa_heads = int(os.environ.get("NUM_MEDUSA_HEADS", 0))
@@ -979,11 +981,13 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    effective_muon_wd = args.muon_wd if args.muon_wd >= 0.0 else args.weight_decay
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
