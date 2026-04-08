@@ -81,7 +81,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 131_072))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
@@ -1065,7 +1065,7 @@ def main() -> None:
     # Artifact EMA: smoothed checkpoint for serialization.
     # Distinct from JEPA EMA (target encoder). This one is always active and
     # its state_dict is what gets quantized and saved at the end of training.
-    artifact_ema: GPT = copy.deepcopy(base_model).to(device).bfloat16()
+    artifact_ema: GPT = copy.deepcopy(base_model).cpu().bfloat16()
     for p in artifact_ema.parameters():
         p.requires_grad_(False)
 
@@ -1335,9 +1335,10 @@ def main() -> None:
         zero_grad_all()
 
         # Artifact EMA: update after each optimizer step (always active).
+        # Kept on CPU to save GPU memory; model_p is transferred per-param.
         with torch.no_grad():
             for ema_p, model_p in zip(artifact_ema.parameters(), base_model.parameters()):
-                ema_p.data.lerp_(model_p.data.to(dtype=ema_p.dtype), 1.0 - args.artifact_ema_decay)
+                ema_p.data.lerp_(model_p.data.cpu().to(dtype=ema_p.dtype), 1.0 - args.artifact_ema_decay)
 
         # JEPA: EMA-update target encoder after each optimizer step.
         # Momentum rises from jepa_ema_momentum (start) to 0.999 (end) as training progresses.
