@@ -131,6 +131,12 @@ class Hyperparameters:
     jepa_span_len_mean = int(os.environ.get("JEPA_SPAN_LEN_MEAN", "16"))
     jepa_span_len_min = int(os.environ.get("JEPA_SPAN_LEN_MIN", "4"))
 
+    # VICReg-style variance and covariance regularization for JEPA anti-collapse.
+    jepa_var_weight = float(os.environ.get("JEPA_VAR_WEIGHT", "0.04"))
+    jepa_cov_weight = float(os.environ.get("JEPA_COV_WEIGHT", "0.02"))
+    jepa_var_gamma  = float(os.environ.get("JEPA_VAR_GAMMA",  "1.0"))
+    jepa_var_eps    = float(os.environ.get("JEPA_VAR_EPS",    "1e-4"))
+
     # BigramHash embedding: lookup table for (token[t-1], token[t]) pairs.
     # Hashed via Cantor pairing into bigram_vocab_size buckets.
     # 0 = disabled. 2048 → ~1.5M params, compresses to ~500KB.
@@ -944,6 +950,33 @@ class GPT(nn.Module):
 
 
 # -----------------------------
+# VICREG HELPERS
+# -----------------------------
+
+def vicreg_var_loss(z: Tensor, gamma: float, eps: float) -> Tensor:
+    """Per-feature variance hinge: penalizes when std drops below gamma."""
+    assert z.ndim == 2, f"vicreg_var_loss expects 2D input, got shape {z.shape}"
+    n = z.shape[0]
+    assert n >= 2, f"vicreg_var_loss requires at least 2 samples, got {n}"
+    z_c = z - z.mean(dim=0)
+    var = z_c.pow(2).sum(dim=0) / (n - 1)
+    std = (var + eps).sqrt()
+    return (gamma - std).clamp(min=0.0).mean()
+
+
+def vicreg_cov_loss(z: Tensor) -> Tensor:
+    """Off-diagonal covariance penalty: penalizes inter-feature correlation."""
+    assert z.ndim == 2, f"vicreg_cov_loss expects 2D input, got shape {z.shape}"
+    n, d = z.shape
+    assert n >= 2, f"vicreg_cov_loss requires at least 2 samples, got {n}"
+    z_c = z - z.mean(dim=0)
+    cov = z_c.T @ z_c / (n - 1)
+    off = cov.pow(2)
+    off.fill_diagonal_(0.0)
+    return off.sum() / d
+
+
+# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -1266,6 +1299,11 @@ def main() -> None:
 
         train_ce_loss = torch.zeros((), device=device)
         train_jepa_loss = torch.zeros((), device=device)
+        train_jepa_mse_loss = torch.zeros((), device=device)
+        train_jepa_var_p_loss = torch.zeros((), device=device)
+        train_jepa_cov_p_loss = torch.zeros((), device=device)
+        train_jepa_var_t_loss = torch.zeros((), device=device)
+        train_jepa_cov_t_loss = torch.zeros((), device=device)
         # Pre-fetch all micro-batches.
         micro_batches = [
             train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
@@ -1284,6 +1322,11 @@ def main() -> None:
             # at masked positions — prediction is genuinely hard because the
             # context encoder cannot see the actual token identity.
             jepa_loss_micro = ce_loss.new_zeros(())
+            jepa_mse_micro = ce_loss.new_zeros(())
+            var_loss_p = ce_loss.new_zeros(())
+            cov_loss_p = ce_loss.new_zeros(())
+            var_loss_t = ce_loss.new_zeros(())
+            cov_loss_t = ce_loss.new_zeros(())
             if eff_jepa > 0.0:
                 # Sample target spans (CPU, one set per micro-batch)
                 spans = sample_block_spans(
@@ -1302,22 +1345,44 @@ def main() -> None:
                     z_context = base_model.encode(x, jepa_mask=jepa_mask)  # [B, T, D]
                     z_pred = base_model.jepa_predictor(z_context)           # [B, T, D]
 
-                # MSE only at masked positions
+                # MSE + VICReg var/cov only at masked positions
                 z_p = z_pred[jepa_mask]         # [N_masked, D]
                 z_t = z_target_full[jepa_mask]  # [N_masked, D]
-                jepa_loss_micro = F.mse_loss(
-                    F.normalize(z_p.float(), dim=-1),
-                    F.normalize(z_t.float(), dim=-1),
+                z_p_f = z_p.float()
+                z_t_f = z_t.float()
+
+                jepa_mse_micro = F.mse_loss(z_p_f, z_t_f)
+
+                # p-side: gradients flow; t-side: diagnostic only
+                var_loss_p = vicreg_var_loss(z_p_f, args.jepa_var_gamma, args.jepa_var_eps)
+                cov_loss_p = vicreg_cov_loss(z_p_f)
+                with torch.no_grad():
+                    var_loss_t = vicreg_var_loss(z_t_f, args.jepa_var_gamma, args.jepa_var_eps)
+                    cov_loss_t = vicreg_cov_loss(z_t_f)
+
+                jepa_loss_micro = (
+                    jepa_mse_micro
+                    + args.jepa_var_weight * var_loss_p
+                    + args.jepa_cov_weight * cov_loss_p
                 )
 
             loss = ce_loss + eff_jepa * jepa_loss_micro
 
             train_ce_loss += ce_loss.detach()
             train_jepa_loss += jepa_loss_micro.detach()
+            train_jepa_mse_loss += jepa_mse_micro.detach()
+            train_jepa_var_p_loss += var_loss_p.detach()
+            train_jepa_cov_p_loss += cov_loss_p.detach()
+            train_jepa_var_t_loss += var_loss_t.detach()
+            train_jepa_cov_t_loss += cov_loss_t.detach()
             (loss * grad_scale).backward()
         train_ce_loss /= grad_accum_steps
         train_jepa_loss /= grad_accum_steps
-        train_loss = train_ce_loss  # used below for logging
+        train_jepa_mse_loss /= grad_accum_steps
+        train_jepa_var_p_loss /= grad_accum_steps
+        train_jepa_cov_p_loss /= grad_accum_steps
+        train_jepa_var_t_loss /= grad_accum_steps
+        train_jepa_cov_t_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1362,7 +1427,15 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            jepa_log = f" jepa_loss:{train_jepa_loss.item():.4f} jepa_lam_scale:{jepa_warmup_frac:.3f}"
+            jepa_log = (
+                f" jepa_loss:{train_jepa_loss.item():.4f}"
+                f" jepa_mse:{train_jepa_mse_loss.item():.4f}"
+                f" jepa_var_p:{train_jepa_var_p_loss.item():.4f}"
+                f" jepa_cov_p:{train_jepa_cov_p_loss.item():.4f}"
+                f" jepa_var_t:{train_jepa_var_t_loss.item():.4f}"
+                f" jepa_cov_t:{train_jepa_cov_t_loss.item():.4f}"
+                f" jepa_lam_scale:{jepa_warmup_frac:.3f}"
+            )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_ce_loss.item():.4f}{jepa_log} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
