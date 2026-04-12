@@ -132,7 +132,7 @@ class Hyperparameters:
     jepa_span_len_min = int(os.environ.get("JEPA_SPAN_LEN_MIN", "4"))
 
     # VICReg-style variance and covariance regularization for JEPA anti-collapse.
-    jepa_var_weight = float(os.environ.get("JEPA_VAR_WEIGHT", "0.04"))
+    jepa_var_weight = float(os.environ.get("JEPA_VAR_WEIGHT", "0.15"))
     jepa_cov_weight = float(os.environ.get("JEPA_COV_WEIGHT", "0.02"))
     jepa_var_gamma  = float(os.environ.get("JEPA_VAR_GAMMA",  "1.0"))
     jepa_var_eps    = float(os.environ.get("JEPA_VAR_EPS",    "1e-4"))
