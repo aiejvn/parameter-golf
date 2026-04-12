@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch._higher_order_ops.associative_scan import associative_scan
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -1114,7 +1115,7 @@ class Mamba2Block(nn.Module):
         self,
         dim: int,
         num_heads: int,
-        d_state: int = 16,
+        d_state: int = 8,
         expand: int = 2,
         conv_size: int = 4,
         mlp_mult: int = 2,
@@ -1169,7 +1170,11 @@ class Mamba2Block(nn.Module):
             d_r, v_r = right
             return d_l * d_r, v_r + d_r * v_l
 
-        _, h_flat = associative_scan(combine_fn, (decay_flat, value_flat), dim=1)
+        def _run_scan(d: Tensor, v: Tensor) -> Tensor:
+            _, out = associative_scan(combine_fn, (d, v), dim=1)
+            return out
+
+        h_flat = grad_checkpoint(_run_scan, decay_flat, value_flat, use_reentrant=False)
         h = h_flat.to(decay.dtype).view(bs, L, nh, hd, ds)
 
         # Contract over d_state with C → [B, L, nh, hd]
