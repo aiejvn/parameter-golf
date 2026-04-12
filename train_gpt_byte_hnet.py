@@ -1157,9 +1157,12 @@ class Mamba2Block(nn.Module):
         decay = dA[:, :, :, None, None].expand(bs, L, nh, hd, ds)
         value = dt[:, :, :, None, None] * xi[:, :, :, :, None] * Bv[:, :, None, None, :]
 
-        # Flatten trailing dims for associative_scan (requires matching shapes)
-        decay_flat = decay.reshape(bs, L, -1)   # [B, L, nh*hd*ds]
-        value_flat = value.reshape(bs, L, -1)
+        # Flatten trailing dims for associative_scan (requires matching shapes).
+        # Cast to bf16 before the scan — inductor materializes fp32 buffers otherwise,
+        # costing 4 GiB per scan tensor at (B=64, L=1024, nh*hd*ds=16384).
+        scan_dtype = torch.bfloat16
+        decay_flat = decay.reshape(bs, L, -1).to(scan_dtype)   # [B, L, nh*hd*ds]
+        value_flat = value.reshape(bs, L, -1).to(scan_dtype)
 
         def combine_fn(left: tuple[Tensor, Tensor], right: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
             d_l, v_l = left
@@ -1167,7 +1170,7 @@ class Mamba2Block(nn.Module):
             return d_l * d_r, v_r + d_r * v_l
 
         _, h_flat = associative_scan(combine_fn, (decay_flat, value_flat), dim=1)
-        h = h_flat.view(bs, L, nh, hd, ds)
+        h = h_flat.to(decay.dtype).view(bs, L, nh, hd, ds)
 
         # Contract over d_state with C → [B, L, nh, hd]
         return (h * Cv[:, :, None, None, :]).sum(-1)
