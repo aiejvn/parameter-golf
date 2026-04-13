@@ -1237,8 +1237,10 @@ class Mamba2Block(nn.Module):
         xi = F.silu(xi)
 
         if _HAS_MAMBA_SSM:
-            # Fast path: fused Triton kernel handles dt_softplus, scan, D skip, z gate
-            y = self._parallel_ssm_triton(xi.view(bs, L, self.nheads, self.headdim), Bv, Cv, dt, z)
+            # Fast path: fused Triton kernel handles dt_softplus, scan, D skip, z gate.
+            # grad_checkpoint discards forward activations and recomputes on backward,
+            # matching the memory budget of the old associative_scan path.
+            y = grad_checkpoint(self._parallel_ssm_triton, xi.view(bs, L, self.nheads, self.headdim), Bv, Cv, dt, z, use_reentrant=False)
         else:
             dt = F.softplus(dt)
             y = self._parallel_ssm(xi.view(bs, L, self.nheads, self.headdim), Bv, Cv, dt)
