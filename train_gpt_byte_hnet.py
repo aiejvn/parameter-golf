@@ -34,6 +34,21 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch._higher_order_ops.associative_scan import associative_scan
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
+# mamba_ssm ships pre-built C++ extensions that may have an ABI mismatch with
+# the current PyTorch install.  Stub out the broken extension so the package
+# __init__ doesn't crash, then import only the Triton SSD kernel we actually need.
+import types as _types
+if 'selective_scan_cuda' not in sys.modules:
+    sys.modules['selective_scan_cuda'] = _types.ModuleType('selective_scan_cuda')
+try:
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined as _mamba_chunk_scan_combined
+    _HAS_MAMBA_SSM = True
+    print("[mamba_ssm] Triton SSD kernel loaded successfully")
+except Exception as e:
+    _mamba_chunk_scan_combined = None
+    _HAS_MAMBA_SSM = False
+    print(f"[mamba_ssm] Triton SSD kernel unavailable, falling back to associative_scan: {e}")
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -1180,6 +1195,31 @@ class Mamba2Block(nn.Module):
         # Contract over d_state with C → [B, L, nh, hd]
         return (h * Cv[:, :, None, None, :]).sum(-1)
 
+    def _parallel_ssm_triton(self, xi: Tensor, Bv: Tensor, Cv: Tensor, dt: Tensor, z: Tensor) -> Tensor:
+        """Fast path using mamba_ssm Triton SSD kernel (mamba_chunk_scan_combined).
+        Fuses the scan, D skip, z gate, and dt_softplus into one kernel call.
+        xi: [B, L, nh, hd]  Bv, Cv: [B, L, d_state]  dt: [B, L, nh]  z: [B, L, d_inner]
+        Returns y: [B, L, d_inner] (already gated by z).
+        """
+        bs, L, nh, hd = xi.shape
+        A = -torch.exp(self.A_log.float())  # [nh]
+        # mamba_chunk_scan_combined expects B/C as [B, L, ngroups, d_state]
+        Bv_4d = Bv.unsqueeze(2)   # [B, L, 1, d_state]
+        Cv_4d = Cv.unsqueeze(2)   # [B, L, 1, d_state]
+        chunk_size = min(64, L)
+        y = _mamba_chunk_scan_combined(
+            xi,           # [B, L, nh, hd]
+            dt,           # [B, L, nh]
+            A,            # [nh]
+            Bv_4d,        # [B, L, 1, d_state]
+            Cv_4d,        # [B, L, 1, d_state]
+            chunk_size,
+            D=self.D.float(),
+            z=z.view(bs, L, nh, hd),  # [B, L, nh, hd]
+            dt_softplus=True,
+        )  # → [B, L, nh, hd]
+        return y.reshape(bs, L, nh * hd)
+
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
@@ -1195,11 +1235,15 @@ class Mamba2Block(nn.Module):
 
         xi = self.conv1d(xi.transpose(1, 2))[:, :, :L].transpose(1, 2)
         xi = F.silu(xi)
-        dt = F.softplus(dt)
 
-        y = self._parallel_ssm(xi.view(bs, L, self.nheads, self.headdim), Bv, Cv, dt)
-        y = y + self.D.to(y.dtype)[None, None, :, None] * xi.view(bs, L, self.nheads, self.headdim)
-        y = y.reshape(bs, L, self.d_inner) * F.silu(z)
+        if _HAS_MAMBA_SSM:
+            # Fast path: fused Triton kernel handles dt_softplus, scan, D skip, z gate
+            y = self._parallel_ssm_triton(xi.view(bs, L, self.nheads, self.headdim), Bv, Cv, dt, z)
+        else:
+            dt = F.softplus(dt)
+            y = self._parallel_ssm(xi.view(bs, L, self.nheads, self.headdim), Bv, Cv, dt)
+            y = y + self.D.to(y.dtype)[None, None, :, None] * xi.view(bs, L, self.nheads, self.headdim)
+            y = y.reshape(bs, L, self.d_inner) * F.silu(z)
 
         x = x + self.ssm_scale.to(x.dtype)[None, None, :] * self.out_proj(y)
         x = x + self.mlp_scale.to(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
