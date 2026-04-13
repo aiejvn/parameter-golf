@@ -1170,6 +1170,7 @@ class Mamba2Block(nn.Module):
             d_r, v_r = right
             return d_l * d_r, v_r + d_r * v_l
 
+        @torch.compiler.disable()
         def _run_scan(d: Tensor, v: Tensor) -> Tensor:
             _, out = associative_scan(combine_fn, (d, v), dim=1)
             return out
