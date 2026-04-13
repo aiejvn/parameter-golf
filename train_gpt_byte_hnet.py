@@ -1206,7 +1206,7 @@ class Mamba2Block(nn.Module):
         # mamba_chunk_scan_combined expects B/C as [B, L, ngroups, d_state]
         Bv_4d = Bv.unsqueeze(2)   # [B, L, 1, d_state]
         Cv_4d = Cv.unsqueeze(2)   # [B, L, 1, d_state]
-        chunk_size = min(64, L)
+        chunk_size = min(256, L)
         y = _mamba_chunk_scan_combined(
             xi,           # [B, L, nh, hd]
             dt,           # [B, L, nh]
