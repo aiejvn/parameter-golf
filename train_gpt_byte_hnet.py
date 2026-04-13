@@ -1864,15 +1864,28 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        _mem_snapshot_enabled = master_process and os.environ.get("MEM_SNAPSHOT", "0") == "1"
+        if _mem_snapshot_enabled:
+            torch.cuda.memory._record_memory_history(max_entries=100_000)
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
-                (warmup_loss * grad_scale).backward()
+                try:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        warmup_loss = model(x, y)
+                    (warmup_loss * grad_scale).backward()
+                except torch.cuda.OutOfMemoryError:
+                    if _mem_snapshot_enabled:
+                        snap_path = f"logs/oom_snapshot_{args.run_id}.pkl"
+                        torch.cuda.memory._dump_snapshot(snap_path)
+                        log0(f"OOM snapshot saved to {snap_path} — view at https://pytorch.org/memory_viz")
+                    log0(f"OOM at warmup_step:{warmup_step} micro_step:{micro_step} "
+                         f"alloc:{torch.cuda.memory_allocated()/1e9:.2f}GB "
+                         f"reserved:{torch.cuda.memory_reserved()/1e9:.2f}GB")
+                    raise
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
