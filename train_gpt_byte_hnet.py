@@ -1189,7 +1189,7 @@ class Mamba2Block(nn.Module):
             _, out = associative_scan(combine_fn, (d, v), dim=1)
             return out
 
-        h_flat = grad_checkpoint(_run_scan, decay_flat, value_flat, use_reentrant=False)
+        h_flat = _run_scan(decay_flat, value_flat)
         h = h_flat.to(decay.dtype).view(bs, L, nh, hd, ds)
 
         # Contract over d_state with C → [B, L, nh, hd]
