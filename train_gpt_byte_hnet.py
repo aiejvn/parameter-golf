@@ -1755,7 +1755,9 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     CastedLinear._qat_enabled = torch.tensor([0], dtype=torch.int32, device=device)
-    compiled_model = torch.compile(base_model, dynamic=False) if args.compile_model else base_model
+    # dynamic=True: handles variable-length chunked sequences from H-Net routing without
+    # recompiling a new graph per shape, preventing gradual VRAM growth from cache accumulation.
+    compiled_model = torch.compile(base_model, dynamic=True) if args.compile_model else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
 
     # Optimizer split:
