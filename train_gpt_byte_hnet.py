@@ -1441,13 +1441,13 @@ class DeChunkLayer(nn.Module):
         decay[:, 0] = 0.0
         weighted_x[:, 0] = hidden_states[:, 0]
 
-        # combine_fn: (d1, v1) o (d2, v2) = (d1*d2, v2 + d2*v1)
-        def combine_fn(left: tuple[Tensor, Tensor], right: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
-            d_left, v_left = left
-            d_right, v_right = right
-            return (d_left * d_right, v_right + d_right * v_left)
-
-        _, smoothed = associative_scan(combine_fn, (decay, weighted_x), dim=1)
+        # Sequential scan: s_t = weighted_x_t + decay_t * s_{t-1}
+        # associative_scan is avoided here because its internal torch.compile call
+        # conflicts with the outer dynamic=True compile (freevars proxy leak).
+        # C is small (~seq_len/chunk_divisor) so a loop in eager is fine.
+        smoothed = weighted_x.clone()
+        for i in range(1, C):
+            smoothed[:, i] = weighted_x[:, i] + decay[:, i] * smoothed[:, i - 1]
 
         # Plug chunk states back to original positions
         chunk_id = torch.cumsum(boundary_mask.long(), dim=1) - 1  # [B, L]
