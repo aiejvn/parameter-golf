@@ -1445,9 +1445,12 @@ class DeChunkLayer(nn.Module):
         # associative_scan is avoided here because its internal torch.compile call
         # conflicts with the outer dynamic=True compile (freevars proxy leak).
         # C is small (~seq_len/chunk_divisor) so a loop in eager is fine.
-        smoothed = weighted_x.clone()
+        # Use a list + stack instead of in-place slice writes to avoid autograd
+        # version-counter conflicts during backward.
+        slices = [weighted_x[:, 0]]
         for i in range(1, C):
-            smoothed[:, i] = weighted_x[:, i] + decay[:, i] * smoothed[:, i - 1]
+            slices.append(weighted_x[:, i] + decay[:, i] * slices[-1])
+        smoothed = torch.stack(slices, dim=1)
 
         # Plug chunk states back to original positions
         chunk_id = torch.cumsum(boundary_mask.long(), dim=1) - 1  # [B, L]
