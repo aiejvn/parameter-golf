@@ -1755,6 +1755,14 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     CastedLinear._qat_enabled = torch.tensor([0], dtype=torch.int32, device=device)
+    # _mamba_chunk_scan_combined is a custom autograd function dynamo cannot trace with
+    # symbolic shapes, causing a graph break mid-encoder that puts DeChunkLayer's
+    # associative_scan in an uncaptured context. Disabling compilation here makes dynamo
+    # treat the Triton call as opaque; the resumed graph then fully captures dechunk0.
+    # The Triton kernel itself still runs at full speed — only inductor fusion around it is skipped.
+    for module in base_model.modules():
+        if isinstance(module, Mamba2Block):
+            module._parallel_ssm_triton = torch.compiler.disable()(module._parallel_ssm_triton)
     # dynamic=True: handles variable-length chunked sequences from H-Net routing without
     # recompiling a new graph per shape, preventing gradual VRAM growth from cache accumulation.
     compiled_model = torch.compile(base_model, dynamic=True) if args.compile_model else base_model
