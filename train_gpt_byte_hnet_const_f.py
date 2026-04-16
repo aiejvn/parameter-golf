@@ -94,8 +94,6 @@ class Hyperparameters:
 
     # H-Net tokenization.
     outer_layers = int(os.environ.get("OUTER_LAYERS", 2))
-    target_avg_chunk_len = float(os.environ.get("TARGET_AVG_CHUNK_LEN", 6.0))
-    ratio_loss_weight = float(os.environ.get("RATIO_LOSS_WEIGHT", 0.03))
     hnet_lr_diff = float(os.environ.get("HNET_LR_DIFF", 0.75))
 
     # Optimizer hyperparameters.
@@ -1346,14 +1344,19 @@ class RoutingModule(nn.Module):
             self.q_proj.weight.copy_(torch.eye(d_model))
             self.k_proj.weight.copy_(torch.eye(d_model))
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        q = F.normalize(self.q_proj(x[:, 1:]), dim=-1)   # [B, L-1, D]
-        k = F.normalize(self.k_proj(x[:, :-1]), dim=-1)  # [B, L-1, D]
-        cos_sim = torch.einsum("bld,bld->bl", q, k)      # [B, L-1]
+    def forward(self, x: Tensor, k: int) -> tuple[Tensor, Tensor, Tensor]:
+        q = F.normalize(self.q_proj(x[:, 1:]), dim=-1)    # [B, L-1, D]
+        kk = F.normalize(self.k_proj(x[:, :-1]), dim=-1)  # [B, L-1, D]
+        cos_sim = torch.einsum("bld,bld->bl", q, kk)      # [B, L-1]
 
         p = ((1.0 - cos_sim) * 0.5).clamp(0.0, 1.0)
-        p = F.pad(p, (1, 0), value=1.0)                  # [B, L]
-        boundary_mask = p >= 0.5                         # [B, L]
+        p = F.pad(p, (1, 0), value=1.0)                   # [B, L], pos 0 always boundary
+        # Hard-set F: always select exactly k boundaries by highest p.
+        # Position 0 is forced; pick top (k-1) from positions 1..L-1.
+        topk_idx = torch.topk(p[:, 1:], k=k - 1, dim=1).indices + 1
+        boundary_mask = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
+        boundary_mask[:, 0] = True
+        boundary_mask.scatter_(1, topk_idx, True)
 
         confidence = torch.where(boundary_mask, p, 1.0 - p)  # [B, L]
         return p, boundary_mask, confidence
@@ -1477,8 +1480,6 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         outer_layers: int,
-        target_avg_chunk_len: float,
-        ratio_loss_weight: float,
         hnet_lr_diff: float = 0.75,
         chunk_divisor: int = 4,
     ):
@@ -1537,8 +1538,6 @@ class GPT(nn.Module):
             self.residual_proj0 = CastedLinear(model_dim, model_dim, bias=False)
             self.residual_proj0._zero_init = True
             self.dechunk0 = DeChunkLayer()
-            self.target_avg_chunk_len = target_avg_chunk_len
-            self.ratio_loss_weight = ratio_loss_weight
 
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1552,30 +1551,6 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _compute_ratio_loss(self, boundary_mask: Tensor, boundary_prob: Tensor) -> Tensor:
-        """
-        Encourage the average boundary rate to match a target average chunk length.
-        boundary_mask: [B, L] bool
-        boundary_prob: [B, L] float
-        """
-        N = self.target_avg_chunk_len
-        if N <= 1.0:
-            raise ValueError(f"TARGET_AVG_CHUNK_LEN must be > 1, got {N}")
-
-        F_val = boundary_mask.float().mean(dim=-1)   # hard boundary rate per example
-        G_val = boundary_prob.mean(dim=-1)           # soft boundary rate per example
-
-        ratio_loss = N / (N - 1.0) * (
-            (N - 1.0) * F_val * G_val + (1.0 - F_val) * (1.0 - G_val)
-        )
-        # Debug stats (detached; no autograd cost). dRatio/dG = (N/(N-1))*(N*F-1);
-        # negative when F < 1/N, meaning loss PUSHES G DOWN during boundary collapse.
-        with torch.no_grad():
-            self._dbg_F = F_val.mean().item()
-            self._dbg_G = G_val.mean().item()
-            self._dbg_ratio_loss_raw = ratio_loss.mean().item()
-        return ratio_loss.mean() * self.ratio_loss_weight
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids) # [BATCH_SIZE, SEQ_LEN, MODEL_DIM] = [B, T, D]
 
@@ -1585,10 +1560,10 @@ class GPT(nn.Module):
             x = self.encoder_stage(x)
             encoder_out = x
 
-            # Routing and chunking
-            p0, bmask0, conf0 = self.routing0(x)
+            # Routing and chunking: hard-set F = 1/chunk_divisor via top-k
+            k = x.shape[1] // self.chunk0.CHUNK_DIVISOR
+            p0, bmask0, conf0 = self.routing0(x, k=k)
             chunked0, pad_mask0, take_idx0 = self.chunk0(x, bmask0)
-
 
             chunked0 = frac_gradient(chunked0, self.hnet_lr_diff ** -1)
 
@@ -1600,7 +1575,6 @@ class GPT(nn.Module):
             ste_conf0 = ste_to_one(conf0).unsqueeze(-1)  # [B, L, 1]
             x = ste_conf0 * dechunked0 + self.residual_proj0(encoder_out.to(self.residual_proj0.weight.dtype))
 
-
             x = frac_gradient(x, self.hnet_lr_diff)
             x = x.to(self.tok_emb.weight.dtype) # Cast back to embedding dtype for decoder stage
 
@@ -1608,14 +1582,14 @@ class GPT(nn.Module):
             x = self.decoder_stage(x)
 
             # Store routing debug state (used by training loop logger and val logger).
-            self._debug_last_chunk_mask = bmask0.detach()
-            self._debug_last_chunked_shape = chunked0.shape
-            aux_loss = self._compute_ratio_loss(bmask0, p0) if self.training else None
+            with torch.no_grad():
+                self._debug_last_chunk_mask = bmask0.detach()
+                self._debug_last_chunked_shape = chunked0.shape
+                self._dbg_F = bmask0.float().mean().item()
+                self._dbg_G = p0.mean().item()
 
         else:
             x = self.main_stage(x)
-            aux_loss = None
-
 
         x = x.reshape(-1, x.size(-1)) # x.size(-1) = MODEL_DIM, reshape to [B*T, D] for LM head
         targets = target_ids.reshape(-1)
@@ -1627,8 +1601,7 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        return ce_loss + aux_loss if aux_loss is not None else ce_loss
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Forward pass returning logits [B, T, V] instead of loss. Used for sliding window eval."""
@@ -1637,7 +1610,8 @@ class GPT(nn.Module):
         if self.use_hnet:
             x = self.encoder_stage(x)
             encoder_out = x
-            p0, bmask0, conf0 = self.routing0(x)
+            k = x.shape[1] // self.chunk0.CHUNK_DIVISOR
+            p0, bmask0, conf0 = self.routing0(x, k=k)
             chunked0, pad_mask0, take_idx0 = self.chunk0(x, bmask0)
             chunked0 = frac_gradient(chunked0, self.hnet_lr_diff ** -1)
             chunked0 = self.main_stage(chunked0)
@@ -1761,8 +1735,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         outer_layers=args.outer_layers,
-        target_avg_chunk_len=args.target_avg_chunk_len,
-        ratio_loss_weight=args.ratio_loss_weight,
         hnet_lr_diff=args.hnet_lr_diff,
         chunk_divisor=args.chunk_divisor,
     ).to(device).bfloat16()
@@ -2036,14 +2008,10 @@ def main() -> None:
             if base_model.use_hnet and hasattr(base_model, "_dbg_F"):
                 F = base_model._dbg_F
                 G = base_model._dbg_G
-                rl_raw = base_model._dbg_ratio_loss_raw
                 avg_chunk_len = 1.0 / max(F, 1e-8)
-                dRdG = args.target_avg_chunk_len / (args.target_avg_chunk_len - 1.0) * (args.target_avg_chunk_len * F - 1.0)
                 log0(
                     f"step:{step} hnet F:{F:.4f} G:{G:.4f} "
-                    f"avg_chunk_len:{avg_chunk_len:.2f} "
-                    f"ratio_loss_raw:{rl_raw:.5f} weighted:{rl_raw * args.ratio_loss_weight:.5f} "
-                    f"dRdG:{dRdG:.4f}"
+                    f"avg_chunk_len:{avg_chunk_len:.2f} target:{args.chunk_divisor}x"
                 )
 
         # Periodic checkpoint saving (rank 0 only)
