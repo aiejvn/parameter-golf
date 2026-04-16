@@ -1568,6 +1568,12 @@ class GPT(nn.Module):
         ratio_loss = N / (N - 1.0) * (
             (N - 1.0) * F_val * G_val + (1.0 - F_val) * (1.0 - G_val)
         )
+        # Debug stats (detached; no autograd cost). dRatio/dG = (N/(N-1))*(N*F-1);
+        # negative when F < 1/N, meaning loss PUSHES G DOWN during boundary collapse.
+        with torch.no_grad():
+            self._dbg_F = F_val.mean().item()
+            self._dbg_G = G_val.mean().item()
+            self._dbg_ratio_loss_raw = ratio_loss.mean().item()
         return ratio_loss.mean() * self.ratio_loss_weight
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1601,6 +1607,9 @@ class GPT(nn.Module):
             # Decoder
             x = self.decoder_stage(x)
 
+            # Store routing debug state (used by training loop logger and val logger).
+            self._debug_last_chunk_mask = bmask0.detach()
+            self._debug_last_chunked_shape = chunked0.shape
             aux_loss = self._compute_ratio_loss(bmask0, p0) if self.training else None
 
         else:
@@ -1954,14 +1963,14 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            # if hasattr(base_model, "_debug_last_chunk_mask"):
-            #     avg_chunk_rate = base_model._debug_last_chunk_mask.float().mean().item()
-            #     avg_chunk_len = 1.0 / max(avg_chunk_rate, 1e-8)
-            #     log0(
-            #         f"chunk_stats step:{step}/{args.iterations} "
-            #         f"avg_chunk_rate:{avg_chunk_rate:.4f} avg_chunk_len:{avg_chunk_len:.2f} "
-            #         f"chunked_shape:{getattr(base_model, '_debug_last_chunked_shape', None)}"
-            #     )
+            if hasattr(base_model, "_debug_last_chunk_mask"):
+                avg_chunk_rate = base_model._debug_last_chunk_mask.float().mean().item()
+                avg_chunk_len = 1.0 / max(avg_chunk_rate, 1e-8)
+                log0(
+                    f"chunk_stats step:{step}/{args.iterations} "
+                    f"avg_chunk_rate:{avg_chunk_rate:.4f} avg_chunk_len:{avg_chunk_len:.2f} "
+                    f"chunked_shape:{getattr(base_model, '_debug_last_chunked_shape', None)}"
+                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -2024,6 +2033,18 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if base_model.use_hnet and hasattr(base_model, "_dbg_F"):
+                F = base_model._dbg_F
+                G = base_model._dbg_G
+                rl_raw = base_model._dbg_ratio_loss_raw
+                avg_chunk_len = 1.0 / max(F, 1e-8)
+                dRdG = args.target_avg_chunk_len / (args.target_avg_chunk_len - 1.0) * (args.target_avg_chunk_len * F - 1.0)
+                log0(
+                    f"step:{step} hnet F:{F:.4f} G:{G:.4f} "
+                    f"avg_chunk_len:{avg_chunk_len:.2f} "
+                    f"ratio_loss_raw:{rl_raw:.5f} weighted:{rl_raw * args.ratio_loss_weight:.5f} "
+                    f"dRdG:{dRdG:.4f}"
+                )
 
         # Periodic checkpoint saving (rank 0 only)
         if args.checkpoint_every > 0 and step % args.checkpoint_every == 0 and rank == 0:
