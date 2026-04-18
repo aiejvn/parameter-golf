@@ -1251,22 +1251,43 @@ class GPT(nn.Module):
 
         if self.universal_transformer:
             if self.act_halting is not None:
-                # ACT path: allocate a probability budget across all num_iters.
-                # not_halted(t) = product of (1 - p_halt) up to iter t.
-                # Output = weighted sum of x_t, weights = p_halt(t) * not_halted(t).
-                # Remainder weight not_halted(N) goes to the final state.
-                # All iters always execute — no dynamic control flow, compile-safe.
-                not_halted = x.new_ones(*x.shape[:2], 1)  # (B, T, 1)
-                x_accum = torch.zeros_like(x)
-                for i in range(self.num_iters):
+                # ACT with separate encoder/decoder budgets.
+                # Each half gets not_halted=1.0 independently; ponder_cost = sum of both remainders.
+                # skips_act carries raw encoder hidden states (x_new per step) — not ACT-weighted,
+                # so the decoder sees the encoder's actual intermediate representations, not the mixture.
+                # The ACT-weighted encoder summary (x_accum_enc + remainder) becomes the decoder main input.
+
+                # --- Encoder ---
+                not_halted_enc = x.new_ones(*x.shape[:2], 1)
+                x_accum_enc = torch.zeros_like(x)
+                skips_act: list[Tensor] = []
+                for i in range(self.num_encoder_iters):
                     x_new = self._shared_block_forward(x, x0, i)
                     x_new = self._apply_recur_gate(x, x_new)
-                    p_halt = self.act_halting(x_new) * not_halted
-                    x_accum = x_accum + p_halt * x_new
-                    not_halted = not_halted * (1.0 - p_halt)
+                    p_halt = self.act_halting(x_new) * not_halted_enc
+                    x_accum_enc = x_accum_enc + p_halt * x_new
+                    not_halted_enc = not_halted_enc * (1.0 - p_halt)
                     x = x_new
-                x = x_accum + not_halted * x  # add remainder
-                ponder_cost = not_halted.mean()  # unspent mass = excess computation
+                    skips_act.append(x)  # raw hidden state → skip connection to decoder
+                x = x_accum_enc + not_halted_enc * x  # ACT-weighted encoder summary → decoder input
+
+                # --- Decoder (fresh budget) ---
+                not_halted_dec = x.new_ones(*x.shape[:2], 1)
+                x_accum_dec = torch.zeros_like(x)
+                for i in range(self.num_decoder_iters):
+                    if skips_act:
+                        skip = skips_act.pop()
+                        skip_gate = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))
+                        scaled_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
+                        x = skip_gate[None, None, :] * x + (1.0 - skip_gate[None, None, :]) * scaled_skip
+                    x_new = self._shared_block_forward(x, x0, self.num_encoder_iters + i)
+                    x_new = self._apply_recur_gate(x, x_new)
+                    p_halt = self.act_halting(x_new) * not_halted_dec
+                    x_accum_dec = x_accum_dec + p_halt * x_new
+                    not_halted_dec = not_halted_dec * (1.0 - p_halt)
+                    x = x_new
+                x = x_accum_dec + not_halted_dec * x
+                ponder_cost = not_halted_enc.mean() + not_halted_dec.mean()
             else:
                 # Standard UT encoder/decoder path + optional masked recurrence.
                 skips: list[Tensor] = []
